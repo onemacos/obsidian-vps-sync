@@ -136,9 +136,14 @@ export class SyncManager {
       );
       const serverManifest: ServerManifest = response.manifest;
 
-      // Collect all local files
+      // Collect all local files — combine vault index + full adapter scan
+      // so that files with unusual extensions (e.g. .mdenc, .canvas) are never missed.
       const localFiles = this.plugin.app.vault.getFiles();
-      const localPaths = new Set(localFiles.map(f => f.path));
+      const adapterPaths = await this.scanAllVaultFiles();
+      const localPaths = new Set([
+        ...localFiles.map(f => f.path),
+        ...adapterPaths,
+      ]);
 
       // Union of all known paths
       const allPaths = new Set([
@@ -160,6 +165,10 @@ export class SyncManager {
         if (localFile instanceof TFile) {
           localContent = await this.plugin.app.vault.readBinary(localFile);
           currentHash = await ManifestManager.computeHash(localContent);
+        } else if (localPaths.has(path)) {
+          // File exists on disk but not yet indexed by Obsidian (e.g. unusual extension)
+          localContent = await this.readFileBytes(path);
+          if (localContent) currentHash = await ManifestManager.computeHash(localContent);
         }
 
         const decision = ConflictResolver.classify(localRecord, serverRecord, currentHash);
@@ -491,6 +500,49 @@ export class SyncManager {
         fn();
       }, DEBOUNCE_MS)
     );
+  }
+
+  /**
+   * Read file bytes using vault API first, with adapter fallback.
+   * Handles files with unusual extensions not fully indexed by Obsidian.
+   */
+  private async readFileBytes(path: string): Promise<ArrayBuffer | null> {
+    const file = this.plugin.app.vault.getAbstractFileByPath(path);
+    if (file instanceof TFile) {
+      return this.plugin.app.vault.readBinary(file);
+    }
+    // Fallback: read directly via adapter for unindexed files
+    try {
+      return await this.plugin.app.vault.adapter.readBinary(path);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Recursively scan the entire vault via the filesystem adapter.
+   * Returns all file paths relative to vault root, skipping hidden system folders.
+   */
+  private async scanAllVaultFiles(): Promise<string[]> {
+    const paths: string[] = [];
+    const scan = async (folder: string) => {
+      try {
+        const result = await this.plugin.app.vault.adapter.list(folder);
+        for (const filePath of result.files) {
+          paths.push(filePath);
+        }
+        for (const subFolder of result.folders) {
+          // Skip .obsidian system folder — handled by excludePatterns
+          if (subFolder === '.obsidian') continue;
+          await scan(subFolder);
+        }
+      } catch {
+        // Ignore unreadable folders (permissions, etc.)
+      }
+    };
+    await scan('/');
+    // Normalise: strip leading slash if present (adapter may vary)
+    return paths.map(p => p.startsWith('/') ? p.slice(1) : p).filter(Boolean);
   }
 
   private async ensureParentFolders(filePath: string): Promise<void> {

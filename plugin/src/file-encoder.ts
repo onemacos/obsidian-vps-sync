@@ -1,9 +1,18 @@
 /** File extensions treated as plain text (synced as UTF-8 strings) */
 const TEXT_EXTENSIONS = new Set([
+  // Standard text formats
   '.md', '.txt', '.json', '.yaml', '.yml', '.csv', '.html', '.htm',
   '.xml', '.js', '.ts', '.jsx', '.tsx', '.css', '.scss', '.less',
   '.sh', '.bash', '.zsh', '.py', '.rb', '.go', '.rs', '.java', '.c',
   '.cpp', '.h', '.toml', '.ini', '.env', '.log', '.svg', '.mjs', '.cjs',
+  // Obsidian-specific formats (all JSON/text based)
+  '.canvas',       // Obsidian Canvas (JSON)
+  '.excalidraw',   // Excalidraw drawings (JSON)
+  '.mdenc',        // Obsidian Encrypt plugin (text with base64 content inside)
+  '.enc',          // Generic encrypted text files
+  '.mdx',          // MDX (markdown + JSX)
+  '.org',          // Org-mode notes
+  '.wiki',         // Wiki-style notes
 ]);
 
 export class FileEncoder {
