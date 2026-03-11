@@ -336,7 +336,7 @@ export class WsHandler {
       } else {
         this.stopPing(ws);
       }
-    }, 30000);
+    }, 15000); // 15s — keeps Cloudflare tunnel alive (100s idle timeout)
     this.pingIntervals.set(ws, interval);
   }
 
@@ -350,10 +350,13 @@ export class WsHandler {
 }
 
 const TEXT_EXTS = new Set([
+  // Standard text formats
   '.md', '.txt', '.json', '.yaml', '.yml', '.csv', '.html', '.htm',
   '.xml', '.js', '.ts', '.jsx', '.tsx', '.css', '.scss', '.less',
   '.sh', '.bash', '.zsh', '.py', '.rb', '.go', '.rs', '.java', '.c',
   '.cpp', '.h', '.toml', '.ini', '.env', '.log', '.svg', '.mjs', '.cjs',
+  // Obsidian-specific formats (must match plugin's file-encoder.ts)
+  '.canvas', '.excalidraw', '.mdenc', '.enc', '.mdx', '.org', '.wiki',
 ]);
 
 function isTextExtension(filePath: string): boolean {

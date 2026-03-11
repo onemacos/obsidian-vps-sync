@@ -44,7 +44,7 @@ export const DEFAULT_SETTINGS: VpsSyncSettings = {
   serverUrl: 'wss://yourserver.com:3241',
   apiKey: '',
   syncEnabled: true,
-  excludePatterns: ['.obsidian/**', '*.tmp', '.DS_Store'],
+  excludePatterns: ['.obsidian/**', '.trash/**', '*.tmp', '.DS_Store'],
 };
 
 // ---------------------------------------------------------------------------

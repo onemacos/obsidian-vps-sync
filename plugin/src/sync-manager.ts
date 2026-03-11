@@ -521,10 +521,20 @@ export class SyncManager {
 
   /**
    * Recursively scan the entire vault via the filesystem adapter.
-   * Returns all file paths relative to vault root, skipping hidden system folders.
+   * Returns all file paths relative to vault root.
+   *
+   * IMPORTANT: must use '' (empty string) for vault root — NOT '/'.
+   * Using '/' causes adapter to return paths with double leading slashes (e.g.
+   * '//Notes/file.md'), which after stripping one slash become '/Notes/file.md'.
+   * The server's sanitizePath() then rejects these as absolute paths and closes
+   * the WebSocket, causing a disconnect/reconnect loop.
    */
   private async scanAllVaultFiles(): Promise<string[]> {
     const paths: string[] = [];
+
+    // Folders to never descend into (Obsidian system + OS trash)
+    const SKIP_FOLDERS = new Set(['.obsidian', '.trash']);
+
     const scan = async (folder: string) => {
       try {
         const result = await this.plugin.app.vault.adapter.list(folder);
@@ -532,17 +542,20 @@ export class SyncManager {
           paths.push(filePath);
         }
         for (const subFolder of result.folders) {
-          // Skip .obsidian system folder — handled by excludePatterns
-          if (subFolder === '.obsidian') continue;
+          // subFolder is relative e.g. 'Notes', 'Notes/sub', '.obsidian'
+          // Check both the full path and just the top-level name
+          const topLevel = subFolder.split('/')[0];
+          if (SKIP_FOLDERS.has(topLevel)) continue;
           await scan(subFolder);
         }
       } catch {
         // Ignore unreadable folders (permissions, etc.)
       }
     };
-    await scan('/');
-    // Normalise: strip leading slash if present (adapter may vary)
-    return paths.map(p => p.startsWith('/') ? p.slice(1) : p).filter(Boolean);
+
+    // Use '' (vault root) — NOT '/' which causes double-slash path corruption
+    await scan('');
+    return paths.filter(Boolean);
   }
 
   private async ensureParentFolders(filePath: string): Promise<void> {
