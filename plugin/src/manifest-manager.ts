@@ -32,6 +32,11 @@ export class ManifestManager {
     delete this.manifest[path];
   }
 
+  /** Wipe the entire in-memory manifest (used by Force Full Sync). */
+  clearAll(): void {
+    this.manifest = {};
+  }
+
   getAllPaths(): string[] {
     return Object.keys(this.manifest);
   }

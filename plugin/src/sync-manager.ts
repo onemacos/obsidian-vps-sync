@@ -91,8 +91,15 @@ export class SyncManager {
 
   // ── Public helpers ────────────────────────────────────────────────────────
 
-  /** Exposed for the settings UI "Sync Now" button */
+  /**
+   * Exposed for the settings UI "Force Full Sync" button and command palette.
+   * Clears the in-memory manifest first so EVERY file is re-evaluated from
+   * scratch — not just files that differ from the cached manifest records.
+   * Without clearing, files already tracked with matching hashes would silently
+   * be treated as 'noop' even if the server no longer has them.
+   */
   async runStartupSyncPublic(): Promise<void> {
+    this.manifestManager.clearAll();
     await this.runStartupSync();
   }
 
@@ -126,9 +133,10 @@ export class SyncManager {
   private async runStartupSync(): Promise<void> {
     this.plugin.statusBar.setStatus('syncing');
     this.conflictCount = 0;
+    const CONCURRENCY = 5;
 
     try {
-      // Fetch server manifest
+      // 1. Fetch server manifest
       const response = await this.client.sendRequest<ManifestResponsePayload>(
         'MANIFEST_REQUEST',
         {},
@@ -136,8 +144,8 @@ export class SyncManager {
       );
       const serverManifest: ServerManifest = response.manifest;
 
-      // Collect all local files — combine vault index + full adapter scan
-      // so that files with unusual extensions (e.g. .mdenc, .canvas) are never missed.
+      // 2. Collect all local files — vault index + full adapter scan so that
+      //    files with unusual extensions (.mdenc, .canvas, .excalidraw …) are never missed.
       const localFiles = this.plugin.app.vault.getFiles();
       const adapterPaths = await this.scanAllVaultFiles();
       const localPaths = new Set([
@@ -145,78 +153,121 @@ export class SyncManager {
         ...adapterPaths,
       ]);
 
-      // Union of all known paths
-      const allPaths = new Set([
+      // 3. Build the full work queue: union of local + server + manifest paths, minus exclusions
+      const allPaths = Array.from(new Set([
         ...localPaths,
         ...Object.keys(serverManifest),
         ...this.manifestManager.getAllPaths(),
-      ]);
+      ])).filter(p => !this.isExcluded(p));
 
-      for (const path of allPaths) {
-        if (this.isExcluded(path)) continue;
+      const total = allPaths.length;
+      new Notice(`VPS Sync: Checking ${total} files…`, 4000);
+      console.log(`[VPS Sync] Startup sync — evaluating ${total} paths`);
 
-        const localRecord = this.manifestManager.getRecord(path);
-        const serverRecord = serverManifest[path];
-        const localFile = this.plugin.app.vault.getAbstractFileByPath(path);
+      let pushed = 0;
+      let pulled = 0;
+      let processed = 0;
 
-        let currentHash = '';
-        let localContent: ArrayBuffer | null = null;
+      // 4. Worker: processes one file path at a time from the shared queue
+      const processOne = async (path: string): Promise<void> => {
+        try {
+          const localRecord = this.manifestManager.getRecord(path);
+          const serverRecord = serverManifest[path];
+          const localFile = this.plugin.app.vault.getAbstractFileByPath(path);
 
-        if (localFile instanceof TFile) {
-          localContent = await this.plugin.app.vault.readBinary(localFile);
-          currentHash = await ManifestManager.computeHash(localContent);
-        } else if (localPaths.has(path)) {
-          // File exists on disk but not yet indexed by Obsidian (e.g. unusual extension)
-          localContent = await this.readFileBytes(path);
-          if (localContent) currentHash = await ManifestManager.computeHash(localContent);
-        }
+          let currentHash = '';
+          let localContent: ArrayBuffer | null = null;
 
-        const decision = ConflictResolver.classify(localRecord, serverRecord, currentHash);
-
-        switch (decision) {
-          case 'push':
-            if (localContent !== null) {
-              await this.pushFileContent(path, localContent, localRecord?.serverMtime ?? 0);
-            }
-            break;
-
-          case 'pull':
-            await this.pullFile(path);
-            break;
-
-          case 'conflict': {
-            // Pull server version to a conflict copy, keep local at original path
-            const conflictPath = ConflictResolver.buildConflictPath(path);
-            await this.pullFileTo(path, conflictPath);
-            // Re-push local version
-            if (localContent !== null) {
-              await this.pushFileContent(path, localContent, 0);
-            }
-            this.conflictCount++;
-            new Notice(`VPS Sync: Conflict on "${path}" — conflict copy created.`);
-            break;
+          if (localFile instanceof TFile) {
+            localContent = await this.plugin.app.vault.readBinary(localFile);
+            currentHash = await ManifestManager.computeHash(localContent);
+          } else if (localPaths.has(path)) {
+            // File exists on disk but not yet indexed by Obsidian (unusual extension)
+            localContent = await this.readFileBytes(path);
+            if (localContent) currentHash = await ManifestManager.computeHash(localContent);
           }
 
-          case 'delete_local':
-            await this.deleteLocalFile(path);
-            break;
+          const decision = ConflictResolver.classify(localRecord, serverRecord, currentHash);
+          console.log(`[VPS Sync] ${decision.padEnd(16)} ${path}`);
 
-          case 'delete_remote':
-            await this.client.sendRequest<FileAckPayload>('FILE_DELETE', { path }, 10000);
-            this.manifestManager.deleteRecord(path);
-            break;
+          switch (decision) {
+            case 'push':
+              if (localContent !== null) {
+                await this.pushFileContent(path, localContent, localRecord?.serverMtime ?? 0);
+                pushed++;
+              }
+              break;
 
-          case 'cleanup_manifest':
-            this.manifestManager.deleteRecord(path);
-            break;
+            case 'pull':
+              await this.pullFile(path);
+              pulled++;
+              break;
 
-          case 'noop':
-          default:
-            break;
+            case 'conflict': {
+              // Pull server version to a conflict copy, keep local at original path
+              const conflictPath = ConflictResolver.buildConflictPath(path);
+              await this.pullFileTo(path, conflictPath);
+              if (localContent !== null) {
+                await this.pushFileContent(path, localContent, 0);
+              }
+              this.conflictCount++;
+              new Notice(`VPS Sync: Conflict on "${path}" — conflict copy created.`);
+              break;
+            }
+
+            case 'delete_local':
+              await this.deleteLocalFile(path);
+              break;
+
+            case 'delete_remote':
+              await this.client.sendRequest<FileAckPayload>('FILE_DELETE', { path }, 10000);
+              this.manifestManager.deleteRecord(path);
+              break;
+
+            case 'cleanup_manifest':
+              this.manifestManager.deleteRecord(path);
+              break;
+
+            case 'noop':
+            default:
+              break;
+          }
+        } catch (e) {
+          // A single file failure must not abort the rest of the sync
+          console.error(`[VPS Sync] Error processing "${path}":`, e);
         }
+      };
+
+      // 5. Worker-pool: CONCURRENCY workers drain the queue simultaneously
+      const queue = [...allPaths];
+      const runWorker = async (): Promise<void> => {
+        while (queue.length > 0) {
+          const path = queue.shift();
+          if (!path) break;
+          await processOne(path);
+          processed++;
+          // Incremental manifest save every 25 files to preserve progress on
+          // interruption (e.g. Obsidian closed mid-sync)
+          if (processed % 25 === 0) {
+            await this.manifestManager.save();
+          }
+        }
+      };
+
+      if (total > 0) {
+        await Promise.all(
+          Array.from({ length: Math.min(CONCURRENCY, total) }, () => runWorker())
+        );
       }
 
+      // 6. Final save + summary
       await this.manifestManager.save();
+
+      const summary = `↑${pushed} pushed, ↓${pulled} pulled` +
+        (this.conflictCount > 0 ? `, ⚠ ${this.conflictCount} conflicts` : '');
+      new Notice(`VPS Sync: Sync complete — ${summary}`);
+      console.log(`[VPS Sync] Sync done — ${summary}`);
+
       if (this.conflictCount > 0) {
         this.plugin.statusBar.showConflictBadge(this.conflictCount);
       } else {
@@ -225,6 +276,7 @@ export class SyncManager {
     } catch (e) {
       console.error('[VPS Sync] Startup sync error', e);
       this.plugin.statusBar.setStatus('error', String(e));
+      new Notice(`VPS Sync: Sync error — ${e}`);
     }
   }
 
