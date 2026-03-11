@@ -1,0 +1,6 @@
+node_modules/
+dist/
+plugin/main.js
+server/.env
+*.js.map
+.DS_Store
