@@ -3,6 +3,7 @@ import fs from 'fs/promises';
 import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
+import { randomUUID } from 'crypto';
 import { createAuthMiddleware } from './auth';
 import { FileManager } from './file-manager';
 import { ServerManifestManager } from './manifest-manager';
@@ -12,6 +13,11 @@ const API_KEY     = process.env.API_KEY     || '';
 const PORT        = parseInt(process.env.PORT ?? '3241', 10);
 const VAULT_PATH  = process.env.VAULT_PATH  || '/opt/vault';
 const BACKUP_PATH = process.env.BACKUP_PATH || '/opt/vault-backups';
+
+// Unique ID for this server instance.  Clients compare this against their
+// stored lastServerId; a mismatch means a new/fresh server so they clear
+// their local manifest to prevent stale delete_local decisions.
+const SERVER_ID = randomUUID();
 
 if (!API_KEY) {
   console.error('[VPS Sync] ERROR: API_KEY is not set. Refusing to start.');
@@ -74,7 +80,7 @@ const wss = new WebSocketServer({ server: httpServer });
 
 const fileManager     = new FileManager(VAULT_PATH, BACKUP_PATH);
 const manifestManager = new ServerManifestManager();
-const wsHandler       = new WsHandler(wss, fileManager, manifestManager, API_KEY);
+const wsHandler       = new WsHandler(wss, fileManager, manifestManager, API_KEY, SERVER_ID);
 
 (async () => {
   // Ensure required directories exist

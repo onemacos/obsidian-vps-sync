@@ -38,6 +38,8 @@ export interface VpsSyncSettings {
   apiKey: string;
   syncEnabled: boolean;
   excludePatterns: string[];  // minimatch glob patterns to skip
+  /** Last server ID seen — used to detect server switches and auto-clear manifest */
+  lastServerId?: string;
 }
 
 export const DEFAULT_SETTINGS: VpsSyncSettings = {
@@ -84,6 +86,8 @@ export interface AuthPayload {
 
 export interface ManifestResponsePayload {
   manifest: ServerManifest;
+  /** Unique ID for this server instance. Changes when server restarts or is replaced. */
+  serverId?: string;
 }
 
 export interface FileUpsertPayload {

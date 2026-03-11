@@ -1,4 +1,4 @@
-import { Plugin } from 'obsidian';
+import { Plugin, Notice } from 'obsidian';
 import { VpsSyncSettingTab } from './settings';
 import { SyncManager } from './sync-manager';
 import { SyncStatusBar } from './status-bar';
@@ -17,6 +17,20 @@ export default class VpsSyncPlugin extends Plugin {
 
     // Sync manager
     this.syncManager = new SyncManager(this, this.settings);
+
+    // ── Ribbon icon (left sidebar) ───────────────────────────────────────────
+    const ribbonIcon = this.addRibbonIcon(
+      'refresh-cw',
+      'VPS Sync — Force full sync',
+      async () => {
+        if (!this.settings.syncEnabled) {
+          new Notice('VPS Sync is disabled. Enable it in settings first.');
+          return;
+        }
+        await this.syncManager.runStartupSyncPublic();
+      }
+    );
+    ribbonIcon.addClass('vps-sync-ribbon-icon');
 
     // Settings tab
     this.addSettingTab(new VpsSyncSettingTab(this.app, this));

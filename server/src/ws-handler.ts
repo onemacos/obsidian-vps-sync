@@ -24,7 +24,8 @@ export class WsHandler {
     private wss: WebSocketServer,
     private fileManager: FileManager,
     private manifestManager: ServerManifestManager,
-    private apiKey: string
+    private apiKey: string,
+    private serverId: string   // unique UUID per server restart — clients use this to detect server changes
   ) {}
 
   initialize(): void {
@@ -123,7 +124,7 @@ export class WsHandler {
     this.send(ws, {
       type: 'MANIFEST_RESPONSE',
       requestId: msg.requestId,
-      payload: { manifest },
+      payload: { manifest, serverId: this.serverId },
     });
   }
 

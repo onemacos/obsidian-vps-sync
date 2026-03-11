@@ -144,6 +144,20 @@ export class SyncManager {
       );
       const serverManifest: ServerManifest = response.manifest;
 
+      // 1b. Server-ID guard — if this is a new/different server, wipe the local
+      //     manifest first so stale manifest records don't trigger delete_local on
+      //     files that simply don't exist on the new server yet.
+      if (response.serverId && response.serverId !== this.settings.lastServerId) {
+        console.log(
+          `[VPS Sync] Server ID changed (${this.settings.lastServerId ?? 'none'} → ${response.serverId}). ` +
+          'Clearing local manifest to prevent stale delete_local decisions.'
+        );
+        this.manifestManager.clearAll();
+        this.settings.lastServerId = response.serverId;
+        await this.plugin.saveSettings();
+        new Notice('VPS Sync: New server detected — doing a clean full sync.');
+      }
+
       // 2. Collect all local files — vault index + full adapter scan so that
       //    files with unusual extensions (.mdenc, .canvas, .excalidraw …) are never missed.
       const localFiles = this.plugin.app.vault.getFiles();
@@ -422,7 +436,9 @@ export class SyncManager {
   private async deleteLocalFile(path: string): Promise<void> {
     const file = this.plugin.app.vault.getAbstractFileByPath(path);
     if (file) {
-      await this.plugin.app.vault.trash(file, true);
+      // Use vault .trash/ (false) not system trash (true) — keeps files recoverable
+      // from within Obsidian itself on all platforms including mobile.
+      await this.plugin.app.vault.trash(file, false);
     }
     this.manifestManager.deleteRecord(path);
   }
