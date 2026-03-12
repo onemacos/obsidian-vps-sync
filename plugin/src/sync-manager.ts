@@ -59,6 +59,15 @@ export class SyncManager {
    */
   private suppressedRenames = new Set<string>();
 
+  /**
+   * Prevents concurrent runStartupSync() calls.
+   * A second startup sync can be triggered if:
+   *   • The WS reconnects while a sync is already in progress.
+   *   • The user double-clicks the Force Sync button.
+   * The second call is silently dropped; the in-flight sync already covers it.
+   */
+  private isSyncing = false;
+
   constructor(
     private plugin: VpsSyncPlugin,
     private settings: VpsSyncSettings
@@ -177,6 +186,14 @@ export class SyncManager {
   // ── Startup sync ──────────────────────────────────────────────────────────
 
   private async runStartupSync(): Promise<void> {
+    // Guard against concurrent syncs (double Force Sync click, WS reconnect
+    // firing while a sync is still in progress, etc.)
+    if (this.isSyncing) {
+      console.log('[VPS Sync] Sync already in progress — skipping concurrent call');
+      return;
+    }
+    this.isSyncing = true;
+
     this.plugin.statusBar.setStatus('syncing');
     this.conflictCount = 0;
     const CONCURRENCY = 5;
@@ -306,7 +323,13 @@ export class SyncManager {
           }
 
         // ── Case B / clearAll: server moved it → apply rename locally ────────
-        } else if (!serverPathInManifest || localPathInManifest) {
+        // Condition: serverPath NOT in manifest (regardless of localPath status).
+        // This correctly covers:
+        //   • Case B proper: !serverInManifest &&  localInManifest   (server moved, local is behind)
+        //   • After clearAll: !serverInManifest && !localInManifest  (server wins)
+        // It correctly EXCLUDES: serverInManifest && localInManifest (both known → ambiguous,
+        //   let classify() decide rather than blindly renaming).
+        } else if (!serverPathInManifest) {
           console.log(`[VPS Sync] Case B rename: local "${localOtherPath}" → "${serverOnlyPath}"`);
           try {
             const file = this.plugin.app.vault.getAbstractFileByPath(localOtherPath);
@@ -316,9 +339,12 @@ export class SyncManager {
               // echo this back to the server.
               this.suppressedRenames.add(localOtherPath);
               await this.plugin.app.vault.rename(file, serverOnlyPath);
+              // 500 ms buffer after debounce so the debounce callback itself
+              // (which fires at DEBOUNCE_MS) is still suppressed even if it
+              // executes slightly late.
               setTimeout(
                 () => this.suppressedRenames.delete(localOtherPath),
-                DEBOUNCE_MS + 200
+                DEBOUNCE_MS + 500
               );
             }
 
@@ -486,6 +512,8 @@ export class SyncManager {
       this.plugin.statusBar.setStatus('error', String(e));
       // Always show sync errors so the user knows something went wrong.
       new Notice(`VPS Sync: Sync error — ${e}`);
+    } finally {
+      this.isSyncing = false;
     }
   }
 
@@ -728,8 +756,9 @@ export class SyncManager {
         // handleRename() — preventing the loop-back re-send to server.
         this.suppressedRenames.add(payload.oldPath);
         await this.plugin.app.vault.rename(existing, payload.newPath);
-        // Remove after the debounce window so any stale timer also gets suppressed.
-        setTimeout(() => this.suppressedRenames.delete(payload.oldPath), DEBOUNCE_MS + 200);
+        // 500 ms buffer so the debounce callback (fires at DEBOUNCE_MS) is
+        // still suppressed even if it executes slightly after its deadline.
+        setTimeout(() => this.suppressedRenames.delete(payload.oldPath), DEBOUNCE_MS + 500);
       } else {
         // File doesn't exist locally (was offline when rename happened).
         // Pull the file from its new server location instead.
@@ -814,8 +843,9 @@ export class SyncManager {
           if (SKIP_FOLDERS.has(topLevel)) continue;
           await scan(subFolder);
         }
-      } catch {
-        // Ignore unreadable folders
+      } catch (e) {
+        // Log so users/devs know something is wrong, but don't abort the scan.
+        console.warn(`[VPS Sync] Could not scan folder "${folder}":`, e);
       }
     };
 
@@ -828,9 +858,16 @@ export class SyncManager {
     parts.pop(); // remove filename
     if (parts.length === 0) return;
     const folder = parts.join('/');
-    const existing = this.plugin.app.vault.getAbstractFileByPath(folder);
-    if (!existing) {
-      await this.plugin.app.vault.createFolder(folder).catch(() => {/* already exists */});
+    if (this.plugin.app.vault.getAbstractFileByPath(folder)) return;
+    try {
+      await this.plugin.app.vault.createFolder(folder);
+    } catch (e) {
+      // Suppress only "already exists" — race condition where another op created
+      // the folder between our check and the createFolder call.
+      const msg = String(e).toLowerCase();
+      if (!msg.includes('already exists') && !msg.includes('folder already')) {
+        throw e; // real error (e.g. invalid path) — let caller handle it
+      }
     }
   }
 }
