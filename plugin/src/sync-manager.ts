@@ -26,7 +26,7 @@ function globMatch(pattern: string, path: string): boolean {
   return new RegExp(`^${regexStr}$`).test(path);
 }
 
-const DEBOUNCE_MS = 500;
+const DEBOUNCE_MS = 1000; // 1 s — gives plugins (Meld Encrypt etc.) time to finish writing
 
 export class SyncManager {
   private client: WsClient;
@@ -34,6 +34,30 @@ export class SyncManager {
   private debounceMap = new Map<string, ReturnType<typeof setTimeout>>();
   private started = false;
   private conflictCount = 0;
+
+  /**
+   * Set to true during an explicit force-sync so that:
+   * 1. Progress notices are shown to the user.
+   * 2. delete_local decisions are overridden to push (re-upload) instead,
+   *    preventing local files being silently moved to trash when the server
+   *    doesn't have them (e.g. after a server rebuild).
+   */
+  private isForceSyncing = false;
+
+  /**
+   * When the user presses Force Sync while the WebSocket is not yet connected
+   * (common on Android after returning from background), this flag queues the
+   * force sync to run as soon as authentication completes.
+   */
+  private pendingForceSync = false;
+
+  /**
+   * Paths added here are temporarily ignored by handleRename().
+   * Used to suppress the loop-back vault rename event that fires when
+   * onRemoteRename() calls vault.rename() — without this, Device B would
+   * re-send FILE_RENAME back to the server every time it applied a remote rename.
+   */
+  private suppressedRenames = new Set<string>();
 
   constructor(
     private plugin: VpsSyncPlugin,
@@ -53,7 +77,15 @@ export class SyncManager {
 
     // Wire up WS events
     this.client.on('statusChange', s => this.plugin.statusBar.setStatus(s));
-    this.client.on('authenticated', () => this.runStartupSync());
+    this.client.on('authenticated', () => {
+      // If a force-sync was requested while we were disconnected, honour it now.
+      if (this.pendingForceSync) {
+        this.pendingForceSync = false;
+        this.doForceSync();
+      } else {
+        this.runStartupSync();
+      }
+    });
     this.client.on('authFail', msg => {
       this.plugin.statusBar.setStatus('error', 'auth failed');
       new Notice(`VPS Sync: Auth failed — ${msg}`);
@@ -92,15 +124,36 @@ export class SyncManager {
   // ── Public helpers ────────────────────────────────────────────────────────
 
   /**
-   * Exposed for the settings UI "Force Full Sync" button and command palette.
-   * Clears the in-memory manifest first so EVERY file is re-evaluated from
-   * scratch — not just files that differ from the cached manifest records.
-   * Without clearing, files already tracked with matching hashes would silently
-   * be treated as 'noop' even if the server no longer has them.
+   * Exposed for the ribbon button, settings UI, and command palette.
+   *
+   * If the WebSocket is not yet connected (common on Android after returning
+   * from background), we trigger an immediate reconnect and queue the sync to
+   * run on the next 'authenticated' event rather than failing with
+   * "WebSocket not connected".
    */
   async runStartupSyncPublic(): Promise<void> {
-    this.manifestManager.clearAll();
-    await this.runStartupSync();
+    if (!this.client.isConnected()) {
+      // Queue the force-sync — it will run as soon as auth completes.
+      this.pendingForceSync = true;
+      this.client.reconnectNow();
+      new Notice('VPS Sync: Reconnecting…', 4000);
+      return;
+    }
+    await this.doForceSync();
+  }
+
+  /**
+   * Run a sync with the force-sync flag active (shows notices, overrides
+   * delete_local → push).  Split out so the 'authenticated' path can also
+   * trigger it when pendingForceSync is set.
+   */
+  private async doForceSync(): Promise<void> {
+    this.isForceSyncing = true;
+    try {
+      await this.runStartupSync();
+    } finally {
+      this.isForceSyncing = false;
+    }
   }
 
   async testConnection(): Promise<boolean> {
@@ -110,20 +163,13 @@ export class SyncManager {
         testClient.disconnect();
         resolve(false);
       }, 8000);
-
       testClient.on('authenticated', () => {
         clearTimeout(timer);
         testClient.disconnect();
         resolve(true);
       });
-      testClient.on('authFail', () => {
-        clearTimeout(timer);
-        resolve(false);
-      });
-      testClient.on('error', () => {
-        clearTimeout(timer);
-        resolve(false);
-      });
+      testClient.on('authFail', () => { clearTimeout(timer); resolve(false); });
+      testClient.on('error',    () => { clearTimeout(timer); resolve(false); });
       testClient.connect();
     });
   }
@@ -135,22 +181,27 @@ export class SyncManager {
     this.conflictCount = 0;
     const CONCURRENCY = 5;
 
+    // Only show the "checking N files" progress notice for manual force syncs.
+    const notify = (msg: string, timeout?: number) => {
+      if (this.isForceSyncing) new Notice(msg, timeout);
+    };
+
     try {
-      // 1. Fetch server manifest
+      // ── 1. Fetch server manifest ───────────────────────────────────────────
       const response = await this.client.sendRequest<ManifestResponsePayload>(
-        'MANIFEST_REQUEST',
-        {},
-        20000
+        'MANIFEST_REQUEST', {}, 20000
       );
       const serverManifest: ServerManifest = response.manifest;
 
-      // 1b. Server-ID guard — if this is a new/different server, wipe the local
-      //     manifest first so stale manifest records don't trigger delete_local on
-      //     files that simply don't exist on the new server yet.
+      // ── 1b. Server-ID guard ────────────────────────────────────────────────
+      // Clear local manifest when the server UUID changes (restart / rebuild)
+      // so stale manifest records don't trigger delete_local on files that
+      // simply don't exist on the new server yet.
       if (response.serverId && response.serverId !== this.settings.lastServerId) {
         console.log(
-          `[VPS Sync] Server ID changed (${this.settings.lastServerId ?? 'none'} → ${response.serverId}). ` +
-          'Clearing local manifest to prevent stale delete_local decisions.'
+          `[VPS Sync] Server ID changed ` +
+          `(${this.settings.lastServerId ?? 'none'} → ${response.serverId}). ` +
+          'Clearing local manifest.'
         );
         this.manifestManager.clearAll();
         this.settings.lastServerId = response.serverId;
@@ -158,8 +209,9 @@ export class SyncManager {
         new Notice('VPS Sync: New server detected — doing a clean full sync.');
       }
 
-      // 2. Collect all local files — vault index + full adapter scan so that
-      //    files with unusual extensions (.mdenc, .canvas, .excalidraw …) are never missed.
+      // ── 2. Collect all local file paths ───────────────────────────────────
+      // Combine Obsidian's vault index with a raw adapter scan so files with
+      // unusual extensions (.mdenc, .canvas, .excalidraw …) are never missed.
       const localFiles = this.plugin.app.vault.getFiles();
       const adapterPaths = await this.scanAllVaultFiles();
       const localPaths = new Set([
@@ -167,41 +219,179 @@ export class SyncManager {
         ...adapterPaths,
       ]);
 
-      // 3. Build the full work queue: union of local + server + manifest paths, minus exclusions
+      // ── 2b. Rename / move detection pre-scan ──────────────────────────────
+      //
+      // Build a hash → localPath map for files that exist locally but are NOT
+      // on the server.  These are the only candidates for rename targets.
+      //
+      // We deliberately skip files already on the server (at the same path)
+      // to avoid false-positive matches between different files with identical
+      // content (e.g. two empty notes, two template copies).
+      const localHashToPath = new Map<string, string>();
+      const localOnlyPaths = [...localPaths].filter(
+        lp => !this.isExcluded(lp) && !serverManifest[lp]
+      );
+      for (const lp of localOnlyPaths) {
+        try {
+          const content = await this.readFileBytes(lp);
+          if (content) {
+            const hash = await ManifestManager.computeHash(content);
+            if (!localHashToPath.has(hash)) localHashToPath.set(hash, lp);
+          }
+        } catch { /* skip unreadable files */ }
+      }
+
+      // ── 2c. Resolve renames / moves before the main classify loop ─────────
+      //
+      // For every server path whose content matches a local-only file, we have
+      // two possible explanations:
+      //
+      //   Case A — local moved, server is behind:
+      //     • serverPath WAS in local manifest (we synced it before)
+      //     • localOtherPath is NOT in local manifest (user moved it here)
+      //     → Send FILE_RENAME to server so it follows local organisation.
+      //
+      //   Case B — server (another device) moved, this device hasn't caught up:
+      //     • serverPath is NOT in local manifest (server moved it to this new path)
+      //     • localOtherPath WAS in local manifest (this is the old local path)
+      //     → Rename locally to match server.  No round-trip needed.
+      //
+      //   After clearAll (manifest is empty): treat same as Case B — "server wins".
+      //   This avoids push + pull creating duplicates at both old and new paths.
+      //
+      // Paths handled here are added to handledPaths and skipped by the
+      // main classify() loop below.
+
+      const handledPaths = new Set<string>();
+      let renamedCount = 0;
+
+      for (const serverOnlyPath of Object.keys(serverManifest)) {
+        if (this.isExcluded(serverOnlyPath)) continue;
+        if (localPaths.has(serverOnlyPath)) continue;   // file still at same path
+
+        const serverHash = serverManifest[serverOnlyPath].hash;
+        const localOtherPath = localHashToPath.get(serverHash);
+        if (!localOtherPath) continue;                   // no local file with same content
+        if (serverManifest[localOtherPath]) continue;    // server already has a file there
+
+        const serverPathInManifest  = !!this.manifestManager.getRecord(serverOnlyPath);
+        const localPathInManifest   = !!this.manifestManager.getRecord(localOtherPath);
+
+        // ── Case A: local moved offline → push the rename to server ─────────
+        if (serverPathInManifest && !localPathInManifest) {
+          console.log(`[VPS Sync] Case A rename: server "${serverOnlyPath}" → local "${localOtherPath}"`);
+          try {
+            const ack = await this.client.sendRequest<FileAckPayload>(
+              'FILE_RENAME',
+              { oldPath: serverOnlyPath, newPath: localOtherPath },
+              10000
+            );
+            if (!ack.success) throw new Error(ack.error ?? 'Rename rejected');
+
+            // Update local manifest
+            const oldRec = this.manifestManager.getRecord(serverOnlyPath)!;
+            this.manifestManager.deleteRecord(serverOnlyPath);
+            this.manifestManager.setRecord(localOtherPath, oldRec);
+
+            // Keep in-memory serverManifest consistent
+            serverManifest[localOtherPath] = serverManifest[serverOnlyPath];
+            delete serverManifest[serverOnlyPath];
+
+            handledPaths.add(serverOnlyPath);
+            handledPaths.add(localOtherPath);
+            renamedCount++;
+          } catch (e) {
+            console.error(`[VPS Sync] Case A rename failed:`, e);
+            // Fall through — classify() will handle these paths
+          }
+
+        // ── Case B / clearAll: server moved it → apply rename locally ────────
+        } else if (!serverPathInManifest || localPathInManifest) {
+          console.log(`[VPS Sync] Case B rename: local "${localOtherPath}" → "${serverOnlyPath}"`);
+          try {
+            const file = this.plugin.app.vault.getAbstractFileByPath(localOtherPath);
+            if (file) {
+              await this.ensureParentFolders(serverOnlyPath);
+              // Suppress the vault rename event so handleRename() doesn't
+              // echo this back to the server.
+              this.suppressedRenames.add(localOtherPath);
+              await this.plugin.app.vault.rename(file, serverOnlyPath);
+              setTimeout(
+                () => this.suppressedRenames.delete(localOtherPath),
+                DEBOUNCE_MS + 200
+              );
+            }
+
+            // Update local manifest
+            const oldRec = this.manifestManager.getRecord(localOtherPath);
+            if (oldRec) {
+              this.manifestManager.deleteRecord(localOtherPath);
+              this.manifestManager.setRecord(serverOnlyPath, oldRec);
+            } else {
+              this.manifestManager.setRecord(serverOnlyPath, {
+                hash: serverHash,
+                serverMtime: serverManifest[serverOnlyPath].mtime,
+                localMtime: Date.now(),
+              });
+            }
+
+            handledPaths.add(serverOnlyPath);
+            handledPaths.add(localOtherPath);
+            renamedCount++;
+          } catch (e) {
+            console.error(`[VPS Sync] Case B rename failed:`, e);
+            // Fall through — classify() will handle these paths
+          }
+        }
+        // Both in manifest → ambiguous (e.g. two identical files); let classify handle
+      }
+
+      // ── 3. Build work queue ───────────────────────────────────────────────
+      // Union of all known paths minus exclusions and already-resolved renames.
       const allPaths = Array.from(new Set([
         ...localPaths,
         ...Object.keys(serverManifest),
         ...this.manifestManager.getAllPaths(),
-      ])).filter(p => !this.isExcluded(p));
+      ])).filter(p => !this.isExcluded(p) && !handledPaths.has(p));
 
       const total = allPaths.length;
-      new Notice(`VPS Sync: Checking ${total} files…`, 4000);
+      notify(`VPS Sync: Checking ${total} files…`, 4000);
       console.log(`[VPS Sync] Startup sync — evaluating ${total} paths`);
 
       let pushed = 0;
       let pulled = 0;
       let processed = 0;
 
-      // 4. Worker: processes one file path at a time from the shared queue
+      // ── 4. Worker: process one path ───────────────────────────────────────
       const processOne = async (path: string): Promise<void> => {
         try {
-          const localRecord = this.manifestManager.getRecord(path);
+          const localRecord  = this.manifestManager.getRecord(path);
           const serverRecord = serverManifest[path];
-          const localFile = this.plugin.app.vault.getAbstractFileByPath(path);
+          const localFile    = this.plugin.app.vault.getAbstractFileByPath(path);
 
           let currentHash = '';
           let localContent: ArrayBuffer | null = null;
 
           if (localFile instanceof TFile) {
-            localContent = await this.plugin.app.vault.readBinary(localFile);
-            currentHash = await ManifestManager.computeHash(localContent);
+            localContent  = await this.plugin.app.vault.readBinary(localFile);
+            currentHash   = await ManifestManager.computeHash(localContent);
           } else if (localPaths.has(path)) {
-            // File exists on disk but not yet indexed by Obsidian (unusual extension)
+            // File exists on disk but not yet indexed by Obsidian
+            // (unusual extension, or mobile vault still scanning)
             localContent = await this.readFileBytes(path);
             if (localContent) currentHash = await ManifestManager.computeHash(localContent);
           }
 
-          const decision = ConflictResolver.classify(localRecord, serverRecord, currentHash);
+          let decision = ConflictResolver.classify(localRecord, serverRecord, currentHash);
+
+          // During a force sync, never silently trash local files.
+          // Re-upload them instead so the server catches up with local state.
+          // This protects against the case where the server lost data without
+          // a serverId change (e.g. manual deletion on server).
+          if (this.isForceSyncing && decision === 'delete_local') {
+            decision = 'push';
+          }
+
           console.log(`[VPS Sync] ${decision.padEnd(16)} ${path}`);
 
           switch (decision) {
@@ -218,13 +408,13 @@ export class SyncManager {
               break;
 
             case 'conflict': {
-              // Pull server version to a conflict copy, keep local at original path
               const conflictPath = ConflictResolver.buildConflictPath(path);
               await this.pullFileTo(path, conflictPath);
               if (localContent !== null) {
                 await this.pushFileContent(path, localContent, 0);
               }
               this.conflictCount++;
+              // Conflicts always shown, even for auto-sync
               new Notice(`VPS Sync: Conflict on "${path}" — conflict copy created.`);
               break;
             }
@@ -247,12 +437,11 @@ export class SyncManager {
               break;
           }
         } catch (e) {
-          // A single file failure must not abort the rest of the sync
           console.error(`[VPS Sync] Error processing "${path}":`, e);
         }
       };
 
-      // 5. Worker-pool: CONCURRENCY workers drain the queue simultaneously
+      // ── 5. Worker-pool: CONCURRENCY workers drain the queue ───────────────
       const queue = [...allPaths];
       const runWorker = async (): Promise<void> => {
         while (queue.length > 0) {
@@ -260,26 +449,31 @@ export class SyncManager {
           if (!path) break;
           await processOne(path);
           processed++;
-          // Incremental manifest save every 25 files to preserve progress on
-          // interruption (e.g. Obsidian closed mid-sync)
-          if (processed % 25 === 0) {
-            await this.manifestManager.save();
-          }
+          if (processed % 25 === 0) await this.manifestManager.save();
         }
       };
-
       if (total > 0) {
         await Promise.all(
           Array.from({ length: Math.min(CONCURRENCY, total) }, () => runWorker())
         );
       }
 
-      // 6. Final save + summary
+      // ── 6. Finish ─────────────────────────────────────────────────────────
       await this.manifestManager.save();
 
-      const summary = `↑${pushed} pushed, ↓${pulled} pulled` +
-        (this.conflictCount > 0 ? `, ⚠ ${this.conflictCount} conflicts` : '');
-      new Notice(`VPS Sync: Sync complete — ${summary}`);
+      const parts: string[] = [];
+      if (pushed  > 0) parts.push(`↑${pushed} pushed`);
+      if (pulled  > 0) parts.push(`↓${pulled} pulled`);
+      if (renamedCount > 0) parts.push(`↔${renamedCount} renamed`);
+      if (this.conflictCount > 0) parts.push(`⚠ ${this.conflictCount} conflicts`);
+
+      const summary = parts.length > 0 ? parts.join(', ') : 'up to date';
+
+      // Only tell the user about the result if they asked for a sync, OR if
+      // there were actual changes/conflicts during an automatic sync.
+      if (this.isForceSyncing || pushed > 0 || pulled > 0 || this.conflictCount > 0) {
+        new Notice(`VPS Sync: ${summary}`);
+      }
       console.log(`[VPS Sync] Sync done — ${summary}`);
 
       if (this.conflictCount > 0) {
@@ -290,6 +484,7 @@ export class SyncManager {
     } catch (e) {
       console.error('[VPS Sync] Startup sync error', e);
       this.plugin.statusBar.setStatus('error', String(e));
+      // Always show sync errors so the user knows something went wrong.
       new Notice(`VPS Sync: Sync error — ${e}`);
     }
   }
@@ -314,6 +509,9 @@ export class SyncManager {
   }
 
   private handleRename(file: TAbstractFile, oldPath: string): void {
+    // Suppress the loop-back rename event that fires when onRemoteRename()
+    // calls vault.rename() — we don't want to re-echo it to the server.
+    if (this.suppressedRenames.has(oldPath)) return;
     if (this.isExcluded(file.path) && this.isExcluded(oldPath)) return;
     this.debounce(file.path, () => this.renameFile(oldPath, file.path));
   }
@@ -324,11 +522,9 @@ export class SyncManager {
     if (!this.client.isConnected()) return;
     try {
       const content = await this.plugin.app.vault.readBinary(file);
-      const hash = await ManifestManager.computeHash(content);
-
+      const hash    = await ManifestManager.computeHash(content);
       const existing = this.manifestManager.getRecord(file.path);
-      if (existing && existing.hash === hash) return; // no change
-
+      if (existing && existing.hash === hash) return; // unchanged
       await this.pushFileContent(file.path, content, existing?.serverMtime ?? 0);
       await this.manifestManager.save();
     } catch (e) {
@@ -345,10 +541,7 @@ export class SyncManager {
     const { encoded, encoding } = FileEncoder.encode(content, path);
 
     const payload: FileUpsertPayload = {
-      path,
-      content: encoded,
-      encoding,
-      hash,
+      path, content: encoded, encoding, hash,
       mtime: Date.now(),
       serverMtime: knownServerMtime,
     };
@@ -367,7 +560,7 @@ export class SyncManager {
 
   private async deleteFile(path: string): Promise<void> {
     if (!this.client.isConnected()) return;
-    if (!this.manifestManager.getRecord(path)) return; // never synced
+    if (!this.manifestManager.getRecord(path)) return; // never synced — skip
     try {
       await this.client.sendRequest<FileAckPayload>('FILE_DELETE', { path }, 10000);
       this.manifestManager.deleteRecord(path);
@@ -380,13 +573,22 @@ export class SyncManager {
   private async renameFile(oldPath: string, newPath: string): Promise<void> {
     if (!this.client.isConnected()) return;
     try {
-      await this.client.sendRequest<FileAckPayload>('FILE_RENAME', { oldPath, newPath }, 10000);
-      const record = this.manifestManager.getRecord(oldPath);
-      if (record) {
-        this.manifestManager.deleteRecord(oldPath);
-        this.manifestManager.setRecord(newPath, record);
+      const ack = await this.client.sendRequest<FileAckPayload>(
+        'FILE_RENAME', { oldPath, newPath }, 10000
+      );
+      // Only update the manifest when the server confirmed the rename.
+      if (ack.success) {
+        const record = this.manifestManager.getRecord(oldPath);
+        if (record) {
+          this.manifestManager.deleteRecord(oldPath);
+          this.manifestManager.setRecord(newPath, record);
+        }
+        await this.manifestManager.save();
+      } else {
+        // Server rejected the rename (e.g. loop-back on same already-done rename).
+        // The manifest already reflects reality on this device so nothing to do.
+        console.warn(`[VPS Sync] Server rejected rename "${oldPath}" → "${newPath}": ${ack.error ?? 'unknown'}`);
       }
-      await this.manifestManager.save();
     } catch (e) {
       console.error(`[VPS Sync] renameFile error`, e);
     }
@@ -401,22 +603,16 @@ export class SyncManager {
   private async pullFileTo(sourcePath: string, destPath: string): Promise<void> {
     if (!this.client.isConnected()) return;
     try {
-      // Do NOT put a custom requestId in the payload — sendRequest generates
-      // the WS-level requestId and the server must echo that same ID back.
       const response = await this.client.sendRequest<PullResponsePayload>(
-        'PULL_REQUEST',
-        { path: sourcePath },
-        30000
+        'PULL_REQUEST', { path: sourcePath }, 30000
       );
-
       const content = FileEncoder.decode(response.content, response.encoding);
-      const hash = await ManifestManager.computeHash(content);
+      const hash    = await ManifestManager.computeHash(content);
 
       const existing = this.plugin.app.vault.getAbstractFileByPath(destPath);
       if (existing instanceof TFile) {
         await this.plugin.app.vault.modifyBinary(existing, content);
       } else {
-        // Create parent folders if needed
         await this.ensureParentFolders(destPath);
         await this.plugin.app.vault.createBinary(destPath, content);
       }
@@ -436,8 +632,8 @@ export class SyncManager {
   private async deleteLocalFile(path: string): Promise<void> {
     const file = this.plugin.app.vault.getAbstractFileByPath(path);
     if (file) {
-      // Use vault .trash/ (false) not system trash (true) — keeps files recoverable
-      // from within Obsidian itself on all platforms including mobile.
+      // false = vault .trash/ folder (recoverable in Obsidian on all platforms).
+      // true  = OS system trash (not accessible from mobile).
       await this.plugin.app.vault.trash(file, false);
     }
     this.manifestManager.deleteRecord(path);
@@ -447,26 +643,22 @@ export class SyncManager {
 
   private async onRemoteChange(payload: FileUpsertPayload): Promise<void> {
     if (this.isExcluded(payload.path)) return;
-
     try {
-      // Check if local file has unsaved changes
-      const existing = this.plugin.app.vault.getAbstractFileByPath(payload.path);
+      const existing    = this.plugin.app.vault.getAbstractFileByPath(payload.path);
       const localRecord = this.manifestManager.getRecord(payload.path);
 
+      // Conflict: local was modified since last sync
       if (existing instanceof TFile && localRecord) {
         const localContent = await this.plugin.app.vault.readBinary(existing);
-        const localHash = await ManifestManager.computeHash(localContent);
+        const localHash    = await ManifestManager.computeHash(localContent);
         if (localHash !== localRecord.hash) {
-          // Local has unsaved changes — conflict
           const conflictPath = ConflictResolver.buildConflictPath(payload.path);
           const content = FileEncoder.decode(payload.content, payload.encoding);
           await this.ensureParentFolders(conflictPath);
           await this.plugin.app.vault.createBinary(conflictPath, content);
           const cHash = await ManifestManager.computeHash(content);
           this.manifestManager.setRecord(conflictPath, {
-            hash: cHash,
-            serverMtime: payload.mtime,
-            localMtime: Date.now(),
+            hash: cHash, serverMtime: payload.mtime, localMtime: Date.now(),
           });
           new Notice(`VPS Sync: Conflict on "${payload.path}" — conflict copy created.`);
           this.plugin.statusBar.showConflictBadge(1);
@@ -475,9 +667,9 @@ export class SyncManager {
         }
       }
 
-      // Safe to apply
+      // Safe to apply remote change
       const content = FileEncoder.decode(payload.content, payload.encoding);
-      const hash = await ManifestManager.computeHash(content);
+      const hash    = await ManifestManager.computeHash(content);
 
       if (existing instanceof TFile) {
         await this.plugin.app.vault.modifyBinary(existing, content);
@@ -489,9 +681,7 @@ export class SyncManager {
       const file = this.plugin.app.vault.getAbstractFileByPath(payload.path);
       const localMtime = file instanceof TFile ? file.stat.mtime : Date.now();
       this.manifestManager.setRecord(payload.path, {
-        hash,
-        serverMtime: payload.mtime,
-        localMtime,
+        hash, serverMtime: payload.mtime, localMtime,
       });
       await this.manifestManager.save();
     } catch (e) {
@@ -503,14 +693,14 @@ export class SyncManager {
     if (this.isExcluded(payload.path)) return;
     try {
       const localRecord = this.manifestManager.getRecord(payload.path);
-      const existing = this.plugin.app.vault.getAbstractFileByPath(payload.path);
+      const existing    = this.plugin.app.vault.getAbstractFileByPath(payload.path);
 
+      // If local was modified after last sync, keep it rather than deleting
       if (existing instanceof TFile && localRecord) {
         const localContent = await this.plugin.app.vault.readBinary(existing);
-        const localHash = await ManifestManager.computeHash(localContent);
+        const localHash    = await ManifestManager.computeHash(localContent);
         if (localHash !== localRecord.hash) {
-          // Local was modified — keep it, just remove from manifest
-          new Notice(`VPS Sync: "${payload.path}" was deleted remotely but has local changes — kept locally.`);
+          // Local has unsaved changes — keep it, just remove from manifest
           this.manifestManager.deleteRecord(payload.path);
           await this.manifestManager.save();
           return;
@@ -518,7 +708,8 @@ export class SyncManager {
       }
 
       if (existing) {
-        await this.plugin.app.vault.trash(existing, true);
+        // Use vault .trash/ (recoverable on mobile) NOT the OS system trash.
+        await this.plugin.app.vault.trash(existing, false);
       }
       this.manifestManager.deleteRecord(payload.path);
       await this.manifestManager.save();
@@ -532,8 +723,20 @@ export class SyncManager {
       const existing = this.plugin.app.vault.getAbstractFileByPath(payload.oldPath);
       if (existing) {
         await this.ensureParentFolders(payload.newPath);
+        // Add to suppressedRenames BEFORE calling vault.rename() so the
+        // vault 'rename' event fired by this operation is ignored by
+        // handleRename() — preventing the loop-back re-send to server.
+        this.suppressedRenames.add(payload.oldPath);
         await this.plugin.app.vault.rename(existing, payload.newPath);
+        // Remove after the debounce window so any stale timer also gets suppressed.
+        setTimeout(() => this.suppressedRenames.delete(payload.oldPath), DEBOUNCE_MS + 200);
+      } else {
+        // File doesn't exist locally (was offline when rename happened).
+        // Pull the file from its new server location instead.
+        await this.pullFile(payload.newPath);
       }
+
+      // Update manifest for the rename
       const record = this.manifestManager.getRecord(payload.oldPath);
       if (record) {
         this.manifestManager.deleteRecord(payload.oldPath);
@@ -546,7 +749,6 @@ export class SyncManager {
   }
 
   private onConflictNotify(payload: ConflictNotifyPayload): void {
-    // Server already created conflict copy — pull it locally
     this.pullFile(payload.conflictPath).catch(console.error);
     new Notice(`VPS Sync: Conflict on "${payload.originalPath}" — conflict copy created.`);
     this.plugin.statusBar.showConflictBadge(1);
@@ -572,14 +774,14 @@ export class SyncManager {
 
   /**
    * Read file bytes using vault API first, with adapter fallback.
-   * Handles files with unusual extensions not fully indexed by Obsidian.
+   * Handles files with unusual extensions not fully indexed by Obsidian
+   * (e.g. .mdenc on some mobile builds).
    */
   private async readFileBytes(path: string): Promise<ArrayBuffer | null> {
     const file = this.plugin.app.vault.getAbstractFileByPath(path);
     if (file instanceof TFile) {
       return this.plugin.app.vault.readBinary(file);
     }
-    // Fallback: read directly via adapter for unindexed files
     try {
       return await this.plugin.app.vault.adapter.readBinary(path);
     } catch {
@@ -599,8 +801,6 @@ export class SyncManager {
    */
   private async scanAllVaultFiles(): Promise<string[]> {
     const paths: string[] = [];
-
-    // Folders to never descend into (Obsidian system + OS trash)
     const SKIP_FOLDERS = new Set(['.obsidian', '.trash']);
 
     const scan = async (folder: string) => {
@@ -610,18 +810,15 @@ export class SyncManager {
           paths.push(filePath);
         }
         for (const subFolder of result.folders) {
-          // subFolder is relative e.g. 'Notes', 'Notes/sub', '.obsidian'
-          // Check both the full path and just the top-level name
           const topLevel = subFolder.split('/')[0];
           if (SKIP_FOLDERS.has(topLevel)) continue;
           await scan(subFolder);
         }
       } catch {
-        // Ignore unreadable folders (permissions, etc.)
+        // Ignore unreadable folders
       }
     };
 
-    // Use '' (vault root) — NOT '/' which causes double-slash path corruption
     await scan('');
     return paths.filter(Boolean);
   }

@@ -116,6 +116,18 @@ export class WsClient {
     this.setStatus('disconnected');
   }
 
+  /**
+   * Cancel any pending reconnect delay and attempt to connect immediately.
+   * Resets the exponential backoff so the next reconnect starts at 1 s again.
+   * Used when the user triggers a manual sync while the socket is offline.
+   */
+  reconnectNow(): void {
+    this.destroying = false; // allow reconnect if previously stopped
+    this.clearReconnect();
+    this.reconnectDelay = 1000; // reset exponential back-off
+    this.connect();
+  }
+
   // ── Sending ───────────────────────────────────────────────────────────────
 
   /** Send a message and wait for a matching ACK or response. */
