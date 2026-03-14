@@ -96,6 +96,9 @@ export class WsHandler {
       case 'PULL_REQUEST':
         await this.handlePullRequest(ws, msg);
         break;
+      case 'MANIFEST_REBUILD':
+        await this.handleManifestRebuild(ws, msg);
+        break;
       case 'PONG':
         // Keep-alive acknowledged
         break;
@@ -126,6 +129,25 @@ export class WsHandler {
       requestId: msg.requestId,
       payload: { manifest, serverId: this.serverId },
     });
+  }
+
+  private async handleManifestRebuild(ws: AuthenticatedSocket, msg: WsMessage): Promise<void> {
+    try {
+      console.log('[VPS Sync] MANIFEST_REBUILD requested by client');
+      const count = await this.manifestManager.buildFromDisk(this.fileManager);
+      this.send(ws, {
+        type: 'MANIFEST_REBUILD_RESULT',
+        requestId: msg.requestId,
+        payload: { success: true, count },
+      });
+    } catch (e) {
+      console.error('[VPS Sync] MANIFEST_REBUILD failed:', e);
+      this.send(ws, {
+        type: 'MANIFEST_REBUILD_RESULT',
+        requestId: msg.requestId,
+        payload: { success: false, error: String(e) },
+      });
+    }
   }
 
   private async handleFileUpsert(ws: AuthenticatedSocket, msg: WsMessage): Promise<void> {

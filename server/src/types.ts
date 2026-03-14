@@ -14,6 +14,8 @@ export type MessageType =
   | 'AUTH_FAIL'
   | 'MANIFEST_REQUEST'
   | 'MANIFEST_RESPONSE'
+  | 'MANIFEST_REBUILD'        // Client requests server to rebuild manifest from disk
+  | 'MANIFEST_REBUILD_RESULT' // Server responds with rebuild result
   | 'FILE_UPSERT'
   | 'FILE_DELETE'
   | 'FILE_RENAME'

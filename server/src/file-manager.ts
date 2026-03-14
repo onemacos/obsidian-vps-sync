@@ -183,7 +183,10 @@ export class FileManager {
     let entries: Dirent[];
     try {
       entries = await fs.readdir(dir, { withFileTypes: true });
-    } catch {
+    } catch (e) {
+      // Log instead of silently dropping — helps diagnose empty-manifest issues
+      // (wrong VAULT_PATH, permission denied, symlink loops, etc.)
+      console.error(`[VPS Sync] Cannot read directory "${dir}":`, e);
       return;
     }
 
