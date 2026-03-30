@@ -163,6 +163,7 @@ export class WsHandler {
     }
 
     const content = this.decodeContent(payload.content, payload.encoding);
+    const incomingHash = this.fileManager.computeHash(content);
 
     try {
       const serverRecord = this.manifestManager.getRecord(relativePath);
@@ -170,8 +171,6 @@ export class WsHandler {
       let conflictPath: string | null = null;
 
       if (serverRecord) {
-        const incomingHash = this.fileManager.computeHash(content);
-
         if (serverRecord.hash === incomingHash) {
           // Idempotent — same content
           this.sendAck(ws, msg.requestId, true, undefined, serverRecord.mtime);
@@ -221,6 +220,15 @@ export class WsHandler {
 
       // Update manifest
       const written = await this.fileManager.readFile(relativePath);
+
+      // Verify write integrity (rclone-style): detect silent corruption
+      if (!conflictPath && written.hash !== incomingHash) {
+        throw new Error(
+          `Write integrity check failed for "${relativePath}": ` +
+          `expected ${incomingHash}, got ${written.hash}`
+        );
+      }
+
       this.manifestManager.update(relativePath, {
         hash: written.hash,
         mtime: written.mtime,

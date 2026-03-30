@@ -254,11 +254,18 @@ export class SyncManager {
       );
       for (const lp of localOnlyPaths) {
         try {
-          const content = await this.readFileBytes(lp);
-          if (content) {
-            const hash = await ManifestManager.computeHash(content);
-            if (!localHashToPath.has(hash)) localHashToPath.set(hash, lp);
+          const lpFile   = this.plugin.app.vault.getAbstractFileByPath(lp);
+          const lpRecord = this.manifestManager.getRecord(lp);
+          let hash: string;
+          // rclone-style: reuse stored hash if mtime unchanged since last sync
+          if (lpFile instanceof TFile && lpRecord && lpFile.stat.mtime === lpRecord.localMtime) {
+            hash = lpRecord.hash;
+          } else {
+            const content = await this.readFileBytes(lp);
+            if (!content) continue;
+            hash = await ManifestManager.computeHash(content);
           }
+          if (!localHashToPath.has(hash)) localHashToPath.set(hash, lp);
         } catch { /* skip unreadable files */ }
       }
 
@@ -403,8 +410,14 @@ export class SyncManager {
           let localContent: ArrayBuffer | null = null;
 
           if (localFile instanceof TFile) {
-            localContent  = await this.plugin.app.vault.readBinary(localFile);
-            currentHash   = await ManifestManager.computeHash(localContent);
+            // rclone-style: skip I/O if mtime is unchanged since last sync
+            if (localRecord && localFile.stat.mtime === localRecord.localMtime) {
+              currentHash = localRecord.hash; // use stored hash — skip readBinary
+              // localContent stays null; lazy-loaded below if push is needed
+            } else {
+              localContent = await this.plugin.app.vault.readBinary(localFile);
+              currentHash  = await ManifestManager.computeHash(localContent);
+            }
           } else if (localPaths.has(path)) {
             // File exists on disk but not yet indexed by Obsidian
             // (unusual extension, or mobile vault still scanning)
@@ -418,22 +431,31 @@ export class SyncManager {
 
           switch (decision) {
             case 'push':
+              // Lazy-load content if mtime skip was applied above
+              if (localContent === null && localFile instanceof TFile) {
+                localContent = await this.plugin.app.vault.readBinary(localFile);
+              }
               if (localContent !== null) {
-                await this.pushFileContent(path, localContent, localRecord?.serverMtime ?? 0);
+                await this.withRetry(path, () =>
+                  this.pushFileContent(path, localContent!, localRecord?.serverMtime ?? 0)
+                );
                 pushed++;
               }
               break;
 
             case 'pull':
-              await this.pullFile(path);
+              await this.withRetry(path, () => this.pullFile(path));
               pulled++;
               break;
 
             case 'conflict': {
               const conflictPath = ConflictResolver.buildConflictPath(path);
-              await this.pullFileTo(path, conflictPath);
+              await this.withRetry(path, () => this.pullFileTo(path, conflictPath));
+              if (localContent === null && localFile instanceof TFile) {
+                localContent = await this.plugin.app.vault.readBinary(localFile);
+              }
               if (localContent !== null) {
-                await this.pushFileContent(path, localContent, 0);
+                await this.withRetry(path, () => this.pushFileContent(path, localContent!, 0));
               }
               this.conflictCount++;
               // Conflicts always shown, even for auto-sync
@@ -446,7 +468,9 @@ export class SyncManager {
               break;
 
             case 'delete_remote':
-              await this.client.sendRequest<FileAckPayload>('FILE_DELETE', { path }, 10000);
+              await this.withRetry(path, () =>
+                this.client.sendRequest<FileAckPayload>('FILE_DELETE', { path }, 10000)
+              );
               this.manifestManager.deleteRecord(path);
               break;
 
@@ -847,6 +871,32 @@ export class SyncManager {
 
     await scan('');
     return paths.filter(Boolean);
+  }
+
+  /**
+   * Retry helper (rclone-style exponential backoff).
+   * Retries transient failures (network blips, server restarts) automatically.
+   * Logs each attempt so the user can diagnose persistent issues.
+   */
+  private async withRetry<T>(
+    path: string,
+    fn: () => Promise<T>,
+    maxRetries = 3
+  ): Promise<T> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await fn();
+      } catch (e) {
+        lastError = e;
+        if (attempt < maxRetries) {
+          const delay = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
+          console.warn(`[VPS Sync] Retry ${attempt + 1}/${maxRetries} for "${path}" in ${delay}ms:`, e);
+          await new Promise(r => setTimeout(r, delay));
+        }
+      }
+    }
+    throw lastError;
   }
 
   private async ensureParentFolders(filePath: string): Promise<void> {
