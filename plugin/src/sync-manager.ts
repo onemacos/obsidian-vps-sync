@@ -36,11 +36,15 @@ export class SyncManager {
   private conflictCount = 0;
 
   /**
-   * Set to true during an explicit force-sync so that:
-   * 1. Progress notices are shown to the user.
-   * 2. delete_local decisions are overridden to push (re-upload) instead,
-   *    preventing local files being silently moved to trash when the server
-   *    doesn't have them (e.g. after a server rebuild).
+   * Set to true during an explicit force-sync so that progress notices are
+   * shown to the user.
+   *
+   * NOTE: We intentionally do NOT override delete_local decisions during a
+   * force sync.  Server data loss after a full rebuild is already handled by
+   * the serverId guard (which calls clearAll() so deleted files are reclassified
+   * as 'push').  Overriding delete_local → push here caused deleted files to
+   * reappear: Device B force-syncs while offline, sees a file the server already
+   * deleted, re-uploads it, and it reappears on every other device.
    */
   private isForceSyncing = false;
 
@@ -408,15 +412,7 @@ export class SyncManager {
             if (localContent) currentHash = await ManifestManager.computeHash(localContent);
           }
 
-          let decision = ConflictResolver.classify(localRecord, serverRecord, currentHash);
-
-          // During a force sync, never silently trash local files.
-          // Re-upload them instead so the server catches up with local state.
-          // This protects against the case where the server lost data without
-          // a serverId change (e.g. manual deletion on server).
-          if (this.isForceSyncing && decision === 'delete_local') {
-            decision = 'push';
-          }
+          const decision = ConflictResolver.classify(localRecord, serverRecord, currentHash);
 
           console.log(`[VPS Sync] ${decision.padEnd(16)} ${path}`);
 
