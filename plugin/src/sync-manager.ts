@@ -406,33 +406,65 @@ export class SyncManager {
       notify(`VPS Sync: Checking ${total} files…`, 4000);
       console.log(`[VPS Sync] Startup sync — evaluating ${total} paths`);
 
-      // ── Excess-deletes guard (rclone-inspired) ────────────────────────────
-      // Pre-classify to count how many local files would be deleted.  If the
-      // ratio exceeds 50 % of what this device knows about, something is almost
-      // certainly wrong (wrong server, corrupted manifest, accidental vault
-      // switch) and we abort rather than silently wiping the local vault.
-      // We only apply this check when the manifest is non-trivially populated
-      // (>= 10 files) so a fresh install doesn't trip it.
-      // Skipped during an explicit Force Sync — user has opted in to whatever
-      // the server says.
+      // ── Safety pre-scan (rclone-inspired, skipped during Force Sync) ─────
+      //
+      // Two guards that protect against catastrophic sync-gone-wrong scenarios.
+      // Both require a non-trivially-populated manifest (>= 10 known files) so
+      // fresh installs and first syncs are never affected.
+      //
+      // Guard 1 — Excess-deletes (rclone --max-delete equivalent):
+      //   If > 50% of known local files would be deleted, abort.  Triggers on:
+      //   wrong server URL, server data wipe, or accidental vault mismatch.
+      //
+      // Guard 2 — Everything-changed (rclone foundSame equivalent):
+      //   If every known file appears modified simultaneously, something outside
+      //   normal editing caused it (DST clock jump, vault folder moved/copied,
+      //   filesystem remount with different mtime precision).  Abort so we don't
+      //   upload or conflict-copy the entire vault at once.
       const manifestSize = this.manifestManager.getAllPaths().length;
       if (!this.isForceSyncing && manifestSize >= 10) {
         let pendingLocalDeletes = 0;
+        let noopOrMinorCount = 0;
+
         for (const p of allPaths) {
           const lr = this.manifestManager.getRecord(p);
           const sr = serverManifest[p];
           const lf = this.plugin.app.vault.getAbstractFileByPath(p);
           const localExists = lf instanceof TFile || localPaths.has(p);
+
+          // Count files that would be deleted locally
           if (lr && !sr && localExists && lr.hash) {
             pendingLocalDeletes++;
           }
+          // Count files that appear unchanged (mtime + server hash match)
+          if (lr && sr && lf instanceof TFile &&
+              lf.stat.mtime === lr.localMtime && sr.hash === lr.hash) {
+            noopOrMinorCount++;
+          }
         }
+
+        // Guard 1: excess deletes
         const deleteRatio = pendingLocalDeletes / manifestSize;
         if (deleteRatio > 0.5) {
           const msg =
             `VPS Sync: Aborted — sync would delete ${pendingLocalDeletes} local ` +
             `files (${Math.round(deleteRatio * 100)}% of known files). ` +
             `This looks wrong. Use Force Sync to override, or check your server.`;
+          console.error(`[VPS Sync] ${msg}`);
+          new Notice(msg, 0);
+          return;
+        }
+
+        // Guard 2: everything-changed (foundSame = false)
+        // Only fires when we have enough existing files on both sides to judge
+        const bothSidesKnown = allPaths.filter(p =>
+          this.manifestManager.getRecord(p) && serverManifest[p]
+        ).length;
+        if (bothSidesKnown >= 10 && noopOrMinorCount === 0) {
+          const msg =
+            `VPS Sync: Aborted — every known file appears changed simultaneously. ` +
+            `This may indicate a clock jump, vault folder move, or wrong server. ` +
+            `Use Force Sync to proceed anyway.`;
           console.error(`[VPS Sync] ${msg}`);
           new Notice(msg, 0);
           return;
@@ -454,9 +486,20 @@ export class SyncManager {
           let localContent: ArrayBuffer | null = null;
 
           if (localFile instanceof TFile) {
-            // rclone-style: skip I/O if mtime is unchanged since last sync
-            if (localRecord && localFile.stat.mtime === localRecord.localMtime) {
-              currentHash = localRecord.hash; // use stored hash — skip readBinary
+            // rclone-style change detection (size → mtime → hash):
+            //   1. If size differs from the server's known size, file definitely
+            //      changed — read and hash immediately (no point checking mtime).
+            //   2. If mtime unchanged since last sync, reuse stored hash (skip I/O).
+            //   3. Otherwise read and compute a fresh hash.
+            const sizeMatchesServer =
+              serverRecord && localFile.stat.size === serverRecord.size;
+            const mtimeUnchanged =
+              localRecord && localFile.stat.mtime === localRecord.localMtime;
+
+            if (mtimeUnchanged && (sizeMatchesServer || !serverRecord)) {
+              // Fast path: mtime unchanged and size agrees with server (or file
+              // is not on the server yet so size can't be compared).
+              currentHash = localRecord!.hash;
               // localContent stays null; lazy-loaded below if push is needed
             } else {
               localContent = await this.plugin.app.vault.readBinary(localFile);
