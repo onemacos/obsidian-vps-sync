@@ -72,6 +72,17 @@ export class SyncManager {
    */
   private isSyncing = false;
 
+  /**
+   * Conflict copy cooldown (rclone-inspired).
+   * Maps path → timestamp of the last conflict copy created for that path.
+   * During continuous active editing, multiple remote pushes can arrive within
+   * seconds of each other.  Without a cooldown, each one creates a new conflict
+   * copy, flooding the vault.  We suppress duplicate copies for the same file
+   * within CONFLICT_COOLDOWN_MS.
+   */
+  private lastConflictTime = new Map<string, number>();
+  private static readonly CONFLICT_COOLDOWN_MS = 10_000; // 10 s between copies
+
   constructor(
     private plugin: VpsSyncPlugin,
     private settings: VpsSyncSettings
@@ -395,6 +406,39 @@ export class SyncManager {
       notify(`VPS Sync: Checking ${total} files…`, 4000);
       console.log(`[VPS Sync] Startup sync — evaluating ${total} paths`);
 
+      // ── Excess-deletes guard (rclone-inspired) ────────────────────────────
+      // Pre-classify to count how many local files would be deleted.  If the
+      // ratio exceeds 50 % of what this device knows about, something is almost
+      // certainly wrong (wrong server, corrupted manifest, accidental vault
+      // switch) and we abort rather than silently wiping the local vault.
+      // We only apply this check when the manifest is non-trivially populated
+      // (>= 10 files) so a fresh install doesn't trip it.
+      // Skipped during an explicit Force Sync — user has opted in to whatever
+      // the server says.
+      const manifestSize = this.manifestManager.getAllPaths().length;
+      if (!this.isForceSyncing && manifestSize >= 10) {
+        let pendingLocalDeletes = 0;
+        for (const p of allPaths) {
+          const lr = this.manifestManager.getRecord(p);
+          const sr = serverManifest[p];
+          const lf = this.plugin.app.vault.getAbstractFileByPath(p);
+          const localExists = lf instanceof TFile || localPaths.has(p);
+          if (lr && !sr && localExists && lr.hash) {
+            pendingLocalDeletes++;
+          }
+        }
+        const deleteRatio = pendingLocalDeletes / manifestSize;
+        if (deleteRatio > 0.5) {
+          const msg =
+            `VPS Sync: Aborted — sync would delete ${pendingLocalDeletes} local ` +
+            `files (${Math.round(deleteRatio * 100)}% of known files). ` +
+            `This looks wrong. Use Force Sync to override, or check your server.`;
+          console.error(`[VPS Sync] ${msg}`);
+          new Notice(msg, 0);
+          return;
+        }
+      }
+
       let pushed = 0;
       let pulled = 0;
       let processed = 0;
@@ -695,19 +739,69 @@ export class SyncManager {
       const existing    = this.plugin.app.vault.getAbstractFileByPath(payload.path);
       const localRecord = this.manifestManager.getRecord(payload.path);
 
-      // Conflict: local was modified since last sync
-      if (existing instanceof TFile && localRecord) {
+      // Decode incoming content once — reused in all branches below
+      const incomingContent = FileEncoder.decode(payload.content, payload.encoding);
+      const incomingHash    = await ManifestManager.computeHash(incomingContent);
+
+      if (existing instanceof TFile) {
         const localContent = await this.plugin.app.vault.readBinary(existing);
         const localHash    = await ManifestManager.computeHash(localContent);
-        if (localHash !== localRecord.hash) {
-          const conflictPath = ConflictResolver.buildConflictPath(payload.path);
-          const content = FileEncoder.decode(payload.content, payload.encoding);
-          await this.ensureParentFolders(conflictPath);
-          await this.plugin.app.vault.createBinary(conflictPath, content);
-          const cHash = await ManifestManager.computeHash(content);
-          this.manifestManager.setRecord(conflictPath, {
-            hash: cHash, serverMtime: payload.mtime, localMtime: Date.now(),
+
+        // ── Hash-equal early exit ──────────────────────────────────────────
+        // If our local file already has the exact same content as the incoming
+        // change (e.g. server echoing back our own push, or two devices that
+        // happen to make the same edit), just update serverMtime and skip the
+        // write entirely.  This prevents:
+        //   • Unnecessary modifyBinary → modify event → debounce → push round-trip
+        //   • Spurious conflict copies when content is already identical
+        if (localHash === incomingHash) {
+          this.manifestManager.setRecord(payload.path, {
+            hash: incomingHash,
+            serverMtime: payload.mtime,
+            localMtime: existing.stat.mtime,
           });
+          await this.manifestManager.save();
+          return;
+        }
+
+        // ── Real conflict: local has unsaved edits, server has different content ──
+        // Strategy: save the server's version as a conflict copy so no work is
+        // lost, keep the user's local edits in place, and — critically — update
+        // serverMtime for the original path so the next debounced push sends the
+        // correct baseline mtime and does NOT trigger a second conflict on the
+        // server (the cascade-conflict bug).
+        if (localRecord && localHash !== localRecord.hash) {
+          // CRITICAL: advance serverMtime on the original path so the next push
+          // from this device uses the updated baseline, preventing the server from
+          // seeing serverRecord.mtime > payload.serverMtime and raising a second
+          // conflict on what is really just a continuation of the user's edits.
+          this.manifestManager.setRecord(payload.path, {
+            hash: localRecord.hash,       // local content unchanged
+            serverMtime: payload.mtime,   // ← advance to server's latest mtime
+            localMtime: localRecord.localMtime,
+          });
+
+          // Conflict copy cooldown (rclone-inspired): during continuous active
+          // editing, remote pushes arrive every few seconds.  Suppress duplicate
+          // conflict copies for the same file within CONFLICT_COOLDOWN_MS so the
+          // vault isn't flooded with near-identical copies.
+          const now = Date.now();
+          const lastConflict = this.lastConflictTime.get(payload.path) ?? 0;
+          if (now - lastConflict < SyncManager.CONFLICT_COOLDOWN_MS) {
+            // Already created a copy recently — serverMtime is already updated
+            // above; just save and return without another copy.
+            await this.manifestManager.save();
+            return;
+          }
+          this.lastConflictTime.set(payload.path, now);
+
+          const conflictPath = ConflictResolver.buildConflictPath(payload.path);
+          await this.ensureParentFolders(conflictPath);
+          await this.plugin.app.vault.createBinary(conflictPath, incomingContent);
+          this.manifestManager.setRecord(conflictPath, {
+            hash: incomingHash, serverMtime: payload.mtime, localMtime: now,
+          });
+
           new Notice(`VPS Sync: Conflict on "${payload.path}" — conflict copy created.`);
           this.plugin.statusBar.showConflictBadge(1);
           await this.manifestManager.save();
@@ -715,21 +809,18 @@ export class SyncManager {
         }
       }
 
-      // Safe to apply remote change
-      const content = FileEncoder.decode(payload.content, payload.encoding);
-      const hash    = await ManifestManager.computeHash(content);
-
+      // ── Safe to apply remote change ────────────────────────────────────────
       if (existing instanceof TFile) {
-        await this.plugin.app.vault.modifyBinary(existing, content);
+        await this.plugin.app.vault.modifyBinary(existing, incomingContent);
       } else {
         await this.ensureParentFolders(payload.path);
-        await this.plugin.app.vault.createBinary(payload.path, content);
+        await this.plugin.app.vault.createBinary(payload.path, incomingContent);
       }
 
       const file = this.plugin.app.vault.getAbstractFileByPath(payload.path);
       const localMtime = file instanceof TFile ? file.stat.mtime : Date.now();
       this.manifestManager.setRecord(payload.path, {
-        hash, serverMtime: payload.mtime, localMtime,
+        hash: incomingHash, serverMtime: payload.mtime, localMtime,
       });
       await this.manifestManager.save();
     } catch (e) {
