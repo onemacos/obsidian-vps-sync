@@ -4,6 +4,8 @@ import { WsClient } from './ws-client';
 import { ManifestManager } from './manifest-manager';
 import { ConflictResolver } from './conflict-resolver';
 import { FileEncoder } from './file-encoder';
+import { BaseContentStore } from './base-store';
+import { merge3, isMergeableFile } from './diff3';
 import type {
   VpsSyncSettings,
   ServerManifest,
@@ -72,6 +74,19 @@ export class SyncManager {
    */
   private isSyncing = false;
 
+  /**
+   * Conflict copy cooldown (rclone-inspired).
+   * Maps path → timestamp of the last conflict copy created for that path.
+   * During continuous active editing, multiple remote pushes can arrive within
+   * seconds of each other.  Without a cooldown, each one creates a new conflict
+   * copy, flooding the vault.  We suppress duplicate copies for the same file
+   * within CONFLICT_COOLDOWN_MS.
+   */
+  private lastConflictTime = new Map<string, number>();
+  private static readonly CONFLICT_COOLDOWN_MS = 10_000; // 10 s between copies
+
+  private baseStore!: BaseContentStore;
+
   constructor(
     private plugin: VpsSyncPlugin,
     private settings: VpsSyncSettings
@@ -87,6 +102,7 @@ export class SyncManager {
     this.started = true;
 
     await this.manifestManager.load(this.plugin);
+    this.baseStore = new BaseContentStore(this.plugin);
 
     // Wire up WS events
     this.client.on('statusChange', s => this.plugin.statusBar.setStatus(s));
@@ -254,11 +270,18 @@ export class SyncManager {
       );
       for (const lp of localOnlyPaths) {
         try {
-          const content = await this.readFileBytes(lp);
-          if (content) {
-            const hash = await ManifestManager.computeHash(content);
-            if (!localHashToPath.has(hash)) localHashToPath.set(hash, lp);
+          const lpFile   = this.plugin.app.vault.getAbstractFileByPath(lp);
+          const lpRecord = this.manifestManager.getRecord(lp);
+          let hash: string;
+          // rclone-style: reuse stored hash if mtime unchanged since last sync
+          if (lpFile instanceof TFile && lpRecord && lpFile.stat.mtime === lpRecord.localMtime) {
+            hash = lpRecord.hash;
+          } else {
+            const content = await this.readFileBytes(lp);
+            if (!content) continue;
+            hash = await ManifestManager.computeHash(content);
           }
+          if (!localHashToPath.has(hash)) localHashToPath.set(hash, lp);
         } catch { /* skip unreadable files */ }
       }
 
@@ -388,6 +411,71 @@ export class SyncManager {
       notify(`VPS Sync: Checking ${total} files…`, 4000);
       console.log(`[VPS Sync] Startup sync — evaluating ${total} paths`);
 
+      // ── Safety pre-scan (rclone-inspired, skipped during Force Sync) ─────
+      //
+      // Two guards that protect against catastrophic sync-gone-wrong scenarios.
+      // Both require a non-trivially-populated manifest (>= 10 known files) so
+      // fresh installs and first syncs are never affected.
+      //
+      // Guard 1 — Excess-deletes (rclone --max-delete equivalent):
+      //   If > 50% of known local files would be deleted, abort.  Triggers on:
+      //   wrong server URL, server data wipe, or accidental vault mismatch.
+      //
+      // Guard 2 — Everything-changed (rclone foundSame equivalent):
+      //   If every known file appears modified simultaneously, something outside
+      //   normal editing caused it (DST clock jump, vault folder moved/copied,
+      //   filesystem remount with different mtime precision).  Abort so we don't
+      //   upload or conflict-copy the entire vault at once.
+      const manifestSize = this.manifestManager.getAllPaths().length;
+      if (!this.isForceSyncing && manifestSize >= 10) {
+        let pendingLocalDeletes = 0;
+        let noopOrMinorCount = 0;
+
+        for (const p of allPaths) {
+          const lr = this.manifestManager.getRecord(p);
+          const sr = serverManifest[p];
+          const lf = this.plugin.app.vault.getAbstractFileByPath(p);
+          const localExists = lf instanceof TFile || localPaths.has(p);
+
+          // Count files that would be deleted locally
+          if (lr && !sr && localExists && lr.hash) {
+            pendingLocalDeletes++;
+          }
+          // Count files that appear unchanged (mtime + server hash match)
+          if (lr && sr && lf instanceof TFile &&
+              lf.stat.mtime === lr.localMtime && sr.hash === lr.hash) {
+            noopOrMinorCount++;
+          }
+        }
+
+        // Guard 1: excess deletes
+        const deleteRatio = pendingLocalDeletes / manifestSize;
+        if (deleteRatio > 0.5) {
+          const msg =
+            `VPS Sync: Aborted — sync would delete ${pendingLocalDeletes} local ` +
+            `files (${Math.round(deleteRatio * 100)}% of known files). ` +
+            `This looks wrong. Use Force Sync to override, or check your server.`;
+          console.error(`[VPS Sync] ${msg}`);
+          new Notice(msg, 0);
+          return;
+        }
+
+        // Guard 2: everything-changed (foundSame = false)
+        // Only fires when we have enough existing files on both sides to judge
+        const bothSidesKnown = allPaths.filter(p =>
+          this.manifestManager.getRecord(p) && serverManifest[p]
+        ).length;
+        if (bothSidesKnown >= 10 && noopOrMinorCount === 0) {
+          const msg =
+            `VPS Sync: Aborted — every known file appears changed simultaneously. ` +
+            `This may indicate a clock jump, vault folder move, or wrong server. ` +
+            `Use Force Sync to proceed anyway.`;
+          console.error(`[VPS Sync] ${msg}`);
+          new Notice(msg, 0);
+          return;
+        }
+      }
+
       let pushed = 0;
       let pulled = 0;
       let processed = 0;
@@ -403,8 +491,25 @@ export class SyncManager {
           let localContent: ArrayBuffer | null = null;
 
           if (localFile instanceof TFile) {
-            localContent  = await this.plugin.app.vault.readBinary(localFile);
-            currentHash   = await ManifestManager.computeHash(localContent);
+            // rclone-style change detection (size → mtime → hash):
+            //   1. If size differs from the server's known size, file definitely
+            //      changed — read and hash immediately (no point checking mtime).
+            //   2. If mtime unchanged since last sync, reuse stored hash (skip I/O).
+            //   3. Otherwise read and compute a fresh hash.
+            const sizeMatchesServer =
+              serverRecord && localFile.stat.size === serverRecord.size;
+            const mtimeUnchanged =
+              localRecord && localFile.stat.mtime === localRecord.localMtime;
+
+            if (mtimeUnchanged && (sizeMatchesServer || !serverRecord)) {
+              // Fast path: mtime unchanged and size agrees with server (or file
+              // is not on the server yet so size can't be compared).
+              currentHash = localRecord!.hash;
+              // localContent stays null; lazy-loaded below if push is needed
+            } else {
+              localContent = await this.plugin.app.vault.readBinary(localFile);
+              currentHash  = await ManifestManager.computeHash(localContent);
+            }
           } else if (localPaths.has(path)) {
             // File exists on disk but not yet indexed by Obsidian
             // (unusual extension, or mobile vault still scanning)
@@ -418,26 +523,80 @@ export class SyncManager {
 
           switch (decision) {
             case 'push':
+              // Lazy-load content if mtime skip was applied above
+              if (localContent === null && localFile instanceof TFile) {
+                localContent = await this.plugin.app.vault.readBinary(localFile);
+              }
               if (localContent !== null) {
-                await this.pushFileContent(path, localContent, localRecord?.serverMtime ?? 0);
+                await this.withRetry(path, () =>
+                  this.pushFileContent(path, localContent!, localRecord?.serverMtime ?? 0)
+                );
                 pushed++;
               }
               break;
 
             case 'pull':
-              await this.pullFile(path);
+              await this.withRetry(path, () => this.pullFile(path));
               pulled++;
               break;
 
             case 'conflict': {
-              const conflictPath = ConflictResolver.buildConflictPath(path);
-              await this.pullFileTo(path, conflictPath);
-              if (localContent !== null) {
-                await this.pushFileContent(path, localContent, 0);
+              // ── Attempt 3-way merge before creating conflict copy ──────────
+              let mergeSucceeded = false;
+              if (isMergeableFile(path) && localFile instanceof TFile) {
+                const baseText = await this.baseStore.load(path);
+                if (baseText !== null) {
+                  // Ensure localContent is loaded
+                  if (localContent === null) {
+                    localContent = await this.plugin.app.vault.readBinary(localFile);
+                  }
+                  // Fetch server content for merging
+                  try {
+                    const response = await this.client.sendRequest<PullResponsePayload>(
+                      'PULL_REQUEST', { path }, 30000
+                    );
+                    const serverContent  = FileEncoder.decode(response.content, response.encoding);
+                    const localText      = new TextDecoder().decode(localContent);
+                    const serverText     = new TextDecoder().decode(serverContent);
+                    const result         = merge3(baseText, localText, serverText);
+
+                    if (result !== null) {
+                      const mergedBytes = new TextEncoder().encode(result.merged);
+                      // Write merged content locally and push it back to server
+                      await this.plugin.app.vault.modifyBinary(localFile, mergedBytes.buffer);
+                      await this.withRetry(path, () =>
+                        this.pushFileContent(path, mergedBytes.buffer, response.mtime)
+                      );
+                      await this.baseStore.save(path, result.merged);
+
+                      if (result.conflicts > 0) {
+                        this.conflictCount++;
+                        new Notice(
+                          `VPS Sync: Conflict in "${path}" — ` +
+                          `${result.conflicts} region(s) need manual resolution.`
+                        );
+                      }
+                      mergeSucceeded = true;
+                    }
+                  } catch (mergeErr) {
+                    console.warn(`[VPS Sync] 3-way merge fetch failed for "${path}", falling back:`, mergeErr);
+                  }
+                }
               }
-              this.conflictCount++;
-              // Conflicts always shown, even for auto-sync
-              new Notice(`VPS Sync: Conflict on "${path}" — conflict copy created.`);
+
+              if (!mergeSucceeded) {
+                // Fallback: pull server version as a conflict copy, push local version
+                const conflictPath = ConflictResolver.buildConflictPath(path);
+                await this.withRetry(path, () => this.pullFileTo(path, conflictPath));
+                if (localContent === null && localFile instanceof TFile) {
+                  localContent = await this.plugin.app.vault.readBinary(localFile);
+                }
+                if (localContent !== null) {
+                  await this.withRetry(path, () => this.pushFileContent(path, localContent!, 0));
+                }
+                this.conflictCount++;
+                new Notice(`VPS Sync: Conflict on "${path}" — conflict copy created.`);
+              }
               break;
             }
 
@@ -446,7 +605,9 @@ export class SyncManager {
               break;
 
             case 'delete_remote':
-              await this.client.sendRequest<FileAckPayload>('FILE_DELETE', { path }, 10000);
+              await this.withRetry(path, () =>
+                this.client.sendRequest<FileAckPayload>('FILE_DELETE', { path }, 10000)
+              );
               this.manifestManager.deleteRecord(path);
               break;
 
@@ -579,6 +740,12 @@ export class SyncManager {
         serverMtime: ack.mtime ?? Date.now(),
         localMtime,
       });
+
+      // Save base content so 3-way merge can use it if a conflict arises later
+      if (isMergeableFile(path)) {
+        const text = new TextDecoder().decode(content);
+        await this.baseStore.save(path, text);
+      }
     }
   }
 
@@ -648,6 +815,12 @@ export class SyncManager {
         serverMtime: response.mtime,
         localMtime,
       });
+
+      // Save base so 3-way merge can use it later (only when pulling to the canonical path)
+      if (destPath === sourcePath && isMergeableFile(destPath)) {
+        const text = new TextDecoder().decode(content);
+        await this.baseStore.save(destPath, text);
+      }
     } catch (e) {
       console.error(`[VPS Sync] pullFile error for ${sourcePath}`, e);
     }
@@ -671,19 +844,115 @@ export class SyncManager {
       const existing    = this.plugin.app.vault.getAbstractFileByPath(payload.path);
       const localRecord = this.manifestManager.getRecord(payload.path);
 
-      // Conflict: local was modified since last sync
-      if (existing instanceof TFile && localRecord) {
+      // Decode incoming content once — reused in all branches below
+      const incomingContent = FileEncoder.decode(payload.content, payload.encoding);
+      const incomingHash    = await ManifestManager.computeHash(incomingContent);
+
+      if (existing instanceof TFile) {
         const localContent = await this.plugin.app.vault.readBinary(existing);
         const localHash    = await ManifestManager.computeHash(localContent);
-        if (localHash !== localRecord.hash) {
-          const conflictPath = ConflictResolver.buildConflictPath(payload.path);
-          const content = FileEncoder.decode(payload.content, payload.encoding);
-          await this.ensureParentFolders(conflictPath);
-          await this.plugin.app.vault.createBinary(conflictPath, content);
-          const cHash = await ManifestManager.computeHash(content);
-          this.manifestManager.setRecord(conflictPath, {
-            hash: cHash, serverMtime: payload.mtime, localMtime: Date.now(),
+
+        // ── Hash-equal early exit ──────────────────────────────────────────
+        // If our local file already has the exact same content as the incoming
+        // change (e.g. server echoing back our own push, or two devices that
+        // happen to make the same edit), just update serverMtime and skip the
+        // write entirely.  This prevents:
+        //   • Unnecessary modifyBinary → modify event → debounce → push round-trip
+        //   • Spurious conflict copies when content is already identical
+        if (localHash === incomingHash) {
+          this.manifestManager.setRecord(payload.path, {
+            hash: incomingHash,
+            serverMtime: payload.mtime,
+            localMtime: existing.stat.mtime,
           });
+          await this.manifestManager.save();
+          return;
+        }
+
+        // ── Real conflict: local has unsaved edits, server has different content ──
+        // Strategy:
+        //   1. If the file is text, attempt a 3-way merge using the last-synced base.
+        //      • Clean merge (0 conflicts) → apply merged content silently. No copy needed.
+        //      • Merge with conflict markers → write merged content (with markers) in-place
+        //        so the user can resolve them directly in the file.
+        //   2. For binary files, or when no base is available, fall back to the old
+        //      behaviour: keep local edits in place and create a conflict copy of the
+        //      remote version.
+        //
+        // In all branches, advance serverMtime FIRST to prevent the cascade-conflict bug.
+        if (localRecord && localHash !== localRecord.hash) {
+          // CRITICAL: advance serverMtime on the original path so the next push
+          // from this device uses the updated baseline, preventing the server from
+          // seeing serverRecord.mtime > payload.serverMtime and raising a second
+          // conflict on what is really just a continuation of the user's edits.
+          this.manifestManager.setRecord(payload.path, {
+            hash: localRecord.hash,       // local content unchanged (for now)
+            serverMtime: payload.mtime,   // ← advance to server's latest mtime
+            localMtime: localRecord.localMtime,
+          });
+
+          // ── Attempt 3-way merge ──────────────────────────────────────────
+          if (isMergeableFile(payload.path)) {
+            const baseText = await this.baseStore.load(payload.path);
+            if (baseText !== null) {
+              const localText    = new TextDecoder().decode(localContent);
+              const incomingText = new TextDecoder().decode(incomingContent);
+              const result       = merge3(baseText, localText, incomingText);
+
+              if (result !== null) {
+                const mergedBytes = new TextEncoder().encode(result.merged);
+                const mergedHash  = await ManifestManager.computeHash(mergedBytes.buffer);
+
+                // Apply merged content in place
+                await this.plugin.app.vault.modifyBinary(existing, mergedBytes.buffer);
+                const updatedFile = this.plugin.app.vault.getAbstractFileByPath(payload.path);
+                const newLocalMtime = updatedFile instanceof TFile ? updatedFile.stat.mtime : Date.now();
+
+                this.manifestManager.setRecord(payload.path, {
+                  hash: mergedHash,
+                  serverMtime: payload.mtime,
+                  localMtime: newLocalMtime,
+                });
+
+                // Save new merged content as the base for next conflict
+                await this.baseStore.save(payload.path, result.merged);
+
+                if (result.conflicts > 0) {
+                  new Notice(
+                    `VPS Sync: Conflict in "${payload.path}" — ` +
+                    `${result.conflicts} region(s) need manual resolution.`
+                  );
+                  this.plugin.statusBar.showConflictBadge(result.conflicts);
+                }
+                // else: clean merge — no notice, no badge
+                await this.manifestManager.save();
+                return;
+              }
+            }
+          }
+
+          // ── Conflict copy fallback ───────────────────────────────────────
+          // Conflict copy cooldown (rclone-inspired): during continuous active
+          // editing, remote pushes arrive every few seconds.  Suppress duplicate
+          // conflict copies for the same file within CONFLICT_COOLDOWN_MS so the
+          // vault isn't flooded with near-identical copies.
+          const now = Date.now();
+          const lastConflict = this.lastConflictTime.get(payload.path) ?? 0;
+          if (now - lastConflict < SyncManager.CONFLICT_COOLDOWN_MS) {
+            // Already created a copy recently — serverMtime is already updated
+            // above; just save and return without another copy.
+            await this.manifestManager.save();
+            return;
+          }
+          this.lastConflictTime.set(payload.path, now);
+
+          const conflictPath = ConflictResolver.buildConflictPath(payload.path);
+          await this.ensureParentFolders(conflictPath);
+          await this.plugin.app.vault.createBinary(conflictPath, incomingContent);
+          this.manifestManager.setRecord(conflictPath, {
+            hash: incomingHash, serverMtime: payload.mtime, localMtime: now,
+          });
+
           new Notice(`VPS Sync: Conflict on "${payload.path}" — conflict copy created.`);
           this.plugin.statusBar.showConflictBadge(1);
           await this.manifestManager.save();
@@ -691,21 +960,18 @@ export class SyncManager {
         }
       }
 
-      // Safe to apply remote change
-      const content = FileEncoder.decode(payload.content, payload.encoding);
-      const hash    = await ManifestManager.computeHash(content);
-
+      // ── Safe to apply remote change ────────────────────────────────────────
       if (existing instanceof TFile) {
-        await this.plugin.app.vault.modifyBinary(existing, content);
+        await this.plugin.app.vault.modifyBinary(existing, incomingContent);
       } else {
         await this.ensureParentFolders(payload.path);
-        await this.plugin.app.vault.createBinary(payload.path, content);
+        await this.plugin.app.vault.createBinary(payload.path, incomingContent);
       }
 
       const file = this.plugin.app.vault.getAbstractFileByPath(payload.path);
       const localMtime = file instanceof TFile ? file.stat.mtime : Date.now();
       this.manifestManager.setRecord(payload.path, {
-        hash, serverMtime: payload.mtime, localMtime,
+        hash: incomingHash, serverMtime: payload.mtime, localMtime,
       });
       await this.manifestManager.save();
     } catch (e) {
@@ -847,6 +1113,32 @@ export class SyncManager {
 
     await scan('');
     return paths.filter(Boolean);
+  }
+
+  /**
+   * Retry helper (rclone-style exponential backoff).
+   * Retries transient failures (network blips, server restarts) automatically.
+   * Logs each attempt so the user can diagnose persistent issues.
+   */
+  private async withRetry<T>(
+    path: string,
+    fn: () => Promise<T>,
+    maxRetries = 3
+  ): Promise<T> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await fn();
+      } catch (e) {
+        lastError = e;
+        if (attempt < maxRetries) {
+          const delay = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
+          console.warn(`[VPS Sync] Retry ${attempt + 1}/${maxRetries} for "${path}" in ${delay}ms:`, e);
+          await new Promise(r => setTimeout(r, delay));
+        }
+      }
+    }
+    throw lastError;
   }
 
   private async ensureParentFolders(filePath: string): Promise<void> {
