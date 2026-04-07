@@ -4,6 +4,8 @@ import { WsClient } from './ws-client';
 import { ManifestManager } from './manifest-manager';
 import { ConflictResolver } from './conflict-resolver';
 import { FileEncoder } from './file-encoder';
+import { BaseContentStore } from './base-store';
+import { merge3, isMergeableFile } from './diff3';
 import type {
   VpsSyncSettings,
   ServerManifest,
@@ -83,6 +85,8 @@ export class SyncManager {
   private lastConflictTime = new Map<string, number>();
   private static readonly CONFLICT_COOLDOWN_MS = 10_000; // 10 s between copies
 
+  private baseStore!: BaseContentStore;
+
   constructor(
     private plugin: VpsSyncPlugin,
     private settings: VpsSyncSettings
@@ -98,6 +102,7 @@ export class SyncManager {
     this.started = true;
 
     await this.manifestManager.load(this.plugin);
+    this.baseStore = new BaseContentStore(this.plugin);
 
     // Wire up WS events
     this.client.on('statusChange', s => this.plugin.statusBar.setStatus(s));
@@ -536,17 +541,62 @@ export class SyncManager {
               break;
 
             case 'conflict': {
-              const conflictPath = ConflictResolver.buildConflictPath(path);
-              await this.withRetry(path, () => this.pullFileTo(path, conflictPath));
-              if (localContent === null && localFile instanceof TFile) {
-                localContent = await this.plugin.app.vault.readBinary(localFile);
+              // ── Attempt 3-way merge before creating conflict copy ──────────
+              let mergeSucceeded = false;
+              if (isMergeableFile(path) && localFile instanceof TFile) {
+                const baseText = await this.baseStore.load(path);
+                if (baseText !== null) {
+                  // Ensure localContent is loaded
+                  if (localContent === null) {
+                    localContent = await this.plugin.app.vault.readBinary(localFile);
+                  }
+                  // Fetch server content for merging
+                  try {
+                    const response = await this.client.sendRequest<PullResponsePayload>(
+                      'PULL_REQUEST', { path }, 30000
+                    );
+                    const serverContent  = FileEncoder.decode(response.content, response.encoding);
+                    const localText      = new TextDecoder().decode(localContent);
+                    const serverText     = new TextDecoder().decode(serverContent);
+                    const result         = merge3(baseText, localText, serverText);
+
+                    if (result !== null) {
+                      const mergedBytes = new TextEncoder().encode(result.merged);
+                      // Write merged content locally and push it back to server
+                      await this.plugin.app.vault.modifyBinary(localFile, mergedBytes.buffer);
+                      await this.withRetry(path, () =>
+                        this.pushFileContent(path, mergedBytes.buffer, response.mtime)
+                      );
+                      await this.baseStore.save(path, result.merged);
+
+                      if (result.conflicts > 0) {
+                        this.conflictCount++;
+                        new Notice(
+                          `VPS Sync: Conflict in "${path}" — ` +
+                          `${result.conflicts} region(s) need manual resolution.`
+                        );
+                      }
+                      mergeSucceeded = true;
+                    }
+                  } catch (mergeErr) {
+                    console.warn(`[VPS Sync] 3-way merge fetch failed for "${path}", falling back:`, mergeErr);
+                  }
+                }
               }
-              if (localContent !== null) {
-                await this.withRetry(path, () => this.pushFileContent(path, localContent!, 0));
+
+              if (!mergeSucceeded) {
+                // Fallback: pull server version as a conflict copy, push local version
+                const conflictPath = ConflictResolver.buildConflictPath(path);
+                await this.withRetry(path, () => this.pullFileTo(path, conflictPath));
+                if (localContent === null && localFile instanceof TFile) {
+                  localContent = await this.plugin.app.vault.readBinary(localFile);
+                }
+                if (localContent !== null) {
+                  await this.withRetry(path, () => this.pushFileContent(path, localContent!, 0));
+                }
+                this.conflictCount++;
+                new Notice(`VPS Sync: Conflict on "${path}" — conflict copy created.`);
               }
-              this.conflictCount++;
-              // Conflicts always shown, even for auto-sync
-              new Notice(`VPS Sync: Conflict on "${path}" — conflict copy created.`);
               break;
             }
 
@@ -690,6 +740,12 @@ export class SyncManager {
         serverMtime: ack.mtime ?? Date.now(),
         localMtime,
       });
+
+      // Save base content so 3-way merge can use it if a conflict arises later
+      if (isMergeableFile(path)) {
+        const text = new TextDecoder().decode(content);
+        await this.baseStore.save(path, text);
+      }
     }
   }
 
@@ -759,6 +815,12 @@ export class SyncManager {
         serverMtime: response.mtime,
         localMtime,
       });
+
+      // Save base so 3-way merge can use it later (only when pulling to the canonical path)
+      if (destPath === sourcePath && isMergeableFile(destPath)) {
+        const text = new TextDecoder().decode(content);
+        await this.baseStore.save(destPath, text);
+      }
     } catch (e) {
       console.error(`[VPS Sync] pullFile error for ${sourcePath}`, e);
     }
@@ -808,22 +870,68 @@ export class SyncManager {
         }
 
         // ── Real conflict: local has unsaved edits, server has different content ──
-        // Strategy: save the server's version as a conflict copy so no work is
-        // lost, keep the user's local edits in place, and — critically — update
-        // serverMtime for the original path so the next debounced push sends the
-        // correct baseline mtime and does NOT trigger a second conflict on the
-        // server (the cascade-conflict bug).
+        // Strategy:
+        //   1. If the file is text, attempt a 3-way merge using the last-synced base.
+        //      • Clean merge (0 conflicts) → apply merged content silently. No copy needed.
+        //      • Merge with conflict markers → write merged content (with markers) in-place
+        //        so the user can resolve them directly in the file.
+        //   2. For binary files, or when no base is available, fall back to the old
+        //      behaviour: keep local edits in place and create a conflict copy of the
+        //      remote version.
+        //
+        // In all branches, advance serverMtime FIRST to prevent the cascade-conflict bug.
         if (localRecord && localHash !== localRecord.hash) {
           // CRITICAL: advance serverMtime on the original path so the next push
           // from this device uses the updated baseline, preventing the server from
           // seeing serverRecord.mtime > payload.serverMtime and raising a second
           // conflict on what is really just a continuation of the user's edits.
           this.manifestManager.setRecord(payload.path, {
-            hash: localRecord.hash,       // local content unchanged
+            hash: localRecord.hash,       // local content unchanged (for now)
             serverMtime: payload.mtime,   // ← advance to server's latest mtime
             localMtime: localRecord.localMtime,
           });
 
+          // ── Attempt 3-way merge ──────────────────────────────────────────
+          if (isMergeableFile(payload.path)) {
+            const baseText = await this.baseStore.load(payload.path);
+            if (baseText !== null) {
+              const localText    = new TextDecoder().decode(localContent);
+              const incomingText = new TextDecoder().decode(incomingContent);
+              const result       = merge3(baseText, localText, incomingText);
+
+              if (result !== null) {
+                const mergedBytes = new TextEncoder().encode(result.merged);
+                const mergedHash  = await ManifestManager.computeHash(mergedBytes.buffer);
+
+                // Apply merged content in place
+                await this.plugin.app.vault.modifyBinary(existing, mergedBytes.buffer);
+                const updatedFile = this.plugin.app.vault.getAbstractFileByPath(payload.path);
+                const newLocalMtime = updatedFile instanceof TFile ? updatedFile.stat.mtime : Date.now();
+
+                this.manifestManager.setRecord(payload.path, {
+                  hash: mergedHash,
+                  serverMtime: payload.mtime,
+                  localMtime: newLocalMtime,
+                });
+
+                // Save new merged content as the base for next conflict
+                await this.baseStore.save(payload.path, result.merged);
+
+                if (result.conflicts > 0) {
+                  new Notice(
+                    `VPS Sync: Conflict in "${payload.path}" — ` +
+                    `${result.conflicts} region(s) need manual resolution.`
+                  );
+                  this.plugin.statusBar.showConflictBadge(result.conflicts);
+                }
+                // else: clean merge — no notice, no badge
+                await this.manifestManager.save();
+                return;
+              }
+            }
+          }
+
+          // ── Conflict copy fallback ───────────────────────────────────────
           // Conflict copy cooldown (rclone-inspired): during continuous active
           // editing, remote pushes arrive every few seconds.  Suppress duplicate
           // conflict copies for the same file within CONFLICT_COOLDOWN_MS so the
