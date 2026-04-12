@@ -4,6 +4,10 @@ export interface ServerFileRecord {
   hash: string;
   mtime: number;
   size: number;
+  /** Tombstone: set to true when file is deleted. Kept for TOMBSTONE_TTL_MS. */
+  deleted?: boolean;
+  /** Epoch ms when file was deleted. Used for tombstone TTL expiry. */
+  deletedAt?: number;
 }
 
 export type ServerManifest = Record<string, ServerFileRecord>;

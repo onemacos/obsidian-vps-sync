@@ -85,6 +85,13 @@ export class SyncManager {
   private lastConflictTime = new Map<string, number>();
   private static readonly CONFLICT_COOLDOWN_MS = 10_000; // 10 s between copies
 
+  /**
+   * Paths currently being written by sync operations (pull, merge, conflict copy).
+   * Vault events (create/modify) for these paths are suppressed to prevent
+   * echo-back pushes that cause duplication.
+   */
+  private suppressedPaths = new Set<string>();
+
   private baseStore!: BaseContentStore;
 
   constructor(
@@ -679,17 +686,20 @@ export class SyncManager {
   private handleCreate(file: TAbstractFile): void {
     if (!(file instanceof TFile)) return;
     if (this.isExcluded(file.path)) return;
+    if (this.suppressedPaths.has(file.path)) return; // sync-internal write — don't echo back
     this.debounce(file.path, () => this.pushFile(file));
   }
 
   private handleModify(file: TAbstractFile): void {
     if (!(file instanceof TFile)) return;
     if (this.isExcluded(file.path)) return;
+    if (this.suppressedPaths.has(file.path)) return; // sync-internal write — don't echo back
     this.debounce(file.path, () => this.pushFile(file));
   }
 
   private handleDelete(file: TAbstractFile): void {
     if (this.isExcluded(file.path)) return;
+    if (this.suppressedPaths.has(file.path)) return; // sync-internal delete — don't echo back
     this.debounce(file.path, () => this.deleteFile(file.path));
   }
 
@@ -800,6 +810,9 @@ export class SyncManager {
       const content = FileEncoder.decode(response.content, response.encoding);
       const hash    = await ManifestManager.computeHash(content);
 
+      // Suppress vault events for this path so create/modify doesn't echo back
+      this.suppressedPaths.add(destPath);
+
       const existing = this.plugin.app.vault.getAbstractFileByPath(destPath);
       if (existing instanceof TFile) {
         await this.plugin.app.vault.modifyBinary(existing, content);
@@ -821,12 +834,19 @@ export class SyncManager {
         const text = new TextDecoder().decode(content);
         await this.baseStore.save(destPath, text);
       }
+
+      // Remove suppression after debounce window so user edits are picked up again
+      setTimeout(() => this.suppressedPaths.delete(destPath), DEBOUNCE_MS + 500);
     } catch (e) {
+      this.suppressedPaths.delete(destPath);
       console.error(`[VPS Sync] pullFile error for ${sourcePath}`, e);
     }
   }
 
   private async deleteLocalFile(path: string): Promise<void> {
+    // Suppress vault delete event so we don't echo a FILE_DELETE back to server
+    this.suppressedPaths.add(path);
+
     const file = this.plugin.app.vault.getAbstractFileByPath(path);
     if (file) {
       // false = vault .trash/ folder (recoverable in Obsidian on all platforms).
@@ -834,6 +854,10 @@ export class SyncManager {
       await this.plugin.app.vault.trash(file, false);
     }
     this.manifestManager.deleteRecord(path);
+    // Also clean up base store
+    await this.baseStore.delete(path);
+
+    setTimeout(() => this.suppressedPaths.delete(path), DEBOUNCE_MS + 500);
   }
 
   // ── Remote change handlers (WebSocket push from server) ──────────────────
@@ -903,6 +927,9 @@ export class SyncManager {
                 const mergedBytes = new TextEncoder().encode(result.merged);
                 const mergedHash  = await ManifestManager.computeHash(mergedBytes.buffer);
 
+                // Suppress vault event for the merge write
+                this.suppressedPaths.add(payload.path);
+
                 // Apply merged content in place
                 await this.plugin.app.vault.modifyBinary(existing, mergedBytes.buffer);
                 const updatedFile = this.plugin.app.vault.getAbstractFileByPath(payload.path);
@@ -916,6 +943,8 @@ export class SyncManager {
 
                 // Save new merged content as the base for next conflict
                 await this.baseStore.save(payload.path, result.merged);
+
+                setTimeout(() => this.suppressedPaths.delete(payload.path), DEBOUNCE_MS + 500);
 
                 if (result.conflicts > 0) {
                   new Notice(
@@ -947,11 +976,14 @@ export class SyncManager {
           this.lastConflictTime.set(payload.path, now);
 
           const conflictPath = ConflictResolver.buildConflictPath(payload.path);
+          // Suppress so conflict copy creation doesn't trigger a push
+          this.suppressedPaths.add(conflictPath);
           await this.ensureParentFolders(conflictPath);
           await this.plugin.app.vault.createBinary(conflictPath, incomingContent);
           this.manifestManager.setRecord(conflictPath, {
             hash: incomingHash, serverMtime: payload.mtime, localMtime: now,
           });
+          setTimeout(() => this.suppressedPaths.delete(conflictPath), DEBOUNCE_MS + 500);
 
           new Notice(`VPS Sync: Conflict on "${payload.path}" — conflict copy created.`);
           this.plugin.statusBar.showConflictBadge(1);
@@ -961,6 +993,9 @@ export class SyncManager {
       }
 
       // ── Safe to apply remote change ────────────────────────────────────────
+      // Suppress vault events so the write doesn't trigger an echo-back push
+      this.suppressedPaths.add(payload.path);
+
       if (existing instanceof TFile) {
         await this.plugin.app.vault.modifyBinary(existing, incomingContent);
       } else {
@@ -974,7 +1009,16 @@ export class SyncManager {
         hash: incomingHash, serverMtime: payload.mtime, localMtime,
       });
       await this.manifestManager.save();
+
+      // Save base for future 3-way merges
+      if (isMergeableFile(payload.path)) {
+        const text = new TextDecoder().decode(incomingContent);
+        await this.baseStore.save(payload.path, text);
+      }
+
+      setTimeout(() => this.suppressedPaths.delete(payload.path), DEBOUNCE_MS + 500);
     } catch (e) {
+      this.suppressedPaths.delete(payload.path);
       console.error(`[VPS Sync] onRemoteChange error for ${payload.path}`, e);
     }
   }
@@ -997,13 +1041,20 @@ export class SyncManager {
         }
       }
 
+      // Suppress vault delete event so it doesn't echo back as a FILE_DELETE
+      this.suppressedPaths.add(payload.path);
+
       if (existing) {
         // Use vault .trash/ (recoverable on mobile) NOT the OS system trash.
         await this.plugin.app.vault.trash(existing, false);
       }
       this.manifestManager.deleteRecord(payload.path);
+      await this.baseStore.delete(payload.path);
       await this.manifestManager.save();
+
+      setTimeout(() => this.suppressedPaths.delete(payload.path), DEBOUNCE_MS + 500);
     } catch (e) {
+      this.suppressedPaths.delete(payload.path);
       console.error(`[VPS Sync] onRemoteDelete error`, e);
     }
   }

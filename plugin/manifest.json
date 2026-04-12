@@ -1,7 +1,7 @@
 {
   "id": "vps-sync",
   "name": "VPS Sync",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "minAppVersion": "1.4.0",
   "description": "Real-time vault sync to your own VPS over WebSocket. Conflict copies, binary file support, multi-device broadcast.",
   "author": "onemacos",
