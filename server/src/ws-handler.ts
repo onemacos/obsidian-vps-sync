@@ -163,15 +163,26 @@ export class WsHandler {
     }
 
     const content = this.decodeContent(payload.content, payload.encoding);
+    const incomingHash = this.fileManager.computeHash(content);
 
     try {
+      // ── Tombstone guard ──────────────────────────────────────────────────
+      // If this file was recently deleted on the server, reject the push
+      // so offline devices don't accidentally resurrect deleted files.
+      // The client must send serverMtime=0 (explicit "I know this is new")
+      // to override the tombstone — this only happens after the client has
+      // seen the tombstone in MANIFEST_RESPONSE and still decides to push.
+      if (this.manifestManager.isTombstone(relativePath) && payload.serverMtime > 0) {
+        console.log(`[VPS Sync] Rejecting push for tombstoned file "${relativePath}" — client has stale state`);
+        this.sendAck(ws, msg.requestId, false, 'File was deleted on server. Sync to get latest state.');
+        return;
+      }
+
       const serverRecord = this.manifestManager.getRecord(relativePath);
 
       let conflictPath: string | null = null;
 
       if (serverRecord) {
-        const incomingHash = this.fileManager.computeHash(content);
-
         if (serverRecord.hash === incomingHash) {
           // Idempotent — same content
           this.sendAck(ws, msg.requestId, true, undefined, serverRecord.mtime);
@@ -221,6 +232,15 @@ export class WsHandler {
 
       // Update manifest
       const written = await this.fileManager.readFile(relativePath);
+
+      // Verify write integrity (rclone-style): detect silent corruption
+      if (!conflictPath && written.hash !== incomingHash) {
+        throw new Error(
+          `Write integrity check failed for "${relativePath}": ` +
+          `expected ${incomingHash}, got ${written.hash}`
+        );
+      }
+
       this.manifestManager.update(relativePath, {
         hash: written.hash,
         mtime: written.mtime,

@@ -49,7 +49,16 @@ export class FileManager {
   async writeFile(relativePath: string, content: Buffer): Promise<{ mtime: number }> {
     const absPath = this.sanitizePath(relativePath);
     await fs.mkdir(path.dirname(absPath), { recursive: true });
-    await fs.writeFile(absPath, content);
+    // Atomic write: write to a temp file then rename into place.
+    // Prevents a partial read if the server crashes mid-write.
+    const tmpPath = `${absPath}.${crypto.randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(tmpPath, content);
+      await fs.rename(tmpPath, absPath);
+    } catch (e) {
+      await fs.unlink(tmpPath).catch(() => {});
+      throw e;
+    }
     const stat = await fs.stat(absPath);
     return { mtime: stat.mtimeMs };
   }

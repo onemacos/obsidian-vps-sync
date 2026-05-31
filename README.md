@@ -48,16 +48,33 @@ VPS Sync keeps your Obsidian vault in sync across every device — desktop, Andr
 
 ## Installation
 
-### Option A — BRAT (Recommended, easiest updates)
+### Server — one-line install (Ubuntu / Debian)
+
+Run this on your VPS as root:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/onemacos/obsidian-vps-sync/master/install-server.sh)
+```
+
+This installs Node.js, PM2, downloads the latest release, generates an API key, starts the server, and configures boot autostart.
+
+### Plugin — one-line install (macOS / Linux)
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/onemacos/obsidian-vps-sync/master/install-plugin.sh) /path/to/your/vault
+```
+
+Then in Obsidian: **Settings → Community Plugins → enable VPS Sync → enter your Server URL and API Key**.
+
+> See [`SETUP.md`](SETUP.md) for the full step-by-step guide, Nginx + TLS setup, and troubleshooting.
+
+### Plugin — BRAT (automatic updates)
 
 1. Install [BRAT](https://github.com/TfTHacker/obsidian42-brat) from Obsidian Community Plugins
-2. Open BRAT settings → **Add Beta Plugin**
-3. Enter: `onemacos/obsidian-vps-sync`
-4. Enable **VPS Sync** in Community Plugins
+2. BRAT settings → **Add Beta Plugin** → `onemacos/obsidian-vps-sync`
+3. Enable **VPS Sync** in Community Plugins
 
-BRAT will notify you when new versions are available.
-
-### Option B — Manual
+### Plugin — Manual
 
 1. Download `main.js` and `manifest.json` from the [latest release](https://github.com/onemacos/obsidian-vps-sync/releases/latest)
 2. Create folder: `<your-vault>/.obsidian/plugins/vps-sync/`
@@ -66,7 +83,7 @@ BRAT will notify you when new versions are available.
 
 ---
 
-## Server Setup
+## Server Setup (manual)
 
 ### Requirements
 
@@ -354,7 +371,10 @@ obsidian-vps-sync/
 │   └── ecosystem.config.js    # PM2 config
 │
 ├── manifest.json              # Root manifest (required for BRAT)
-└── SETUP.md                   # Detailed VPS setup guide
+├── install-server.sh          # One-line VPS server installer (Ubuntu/Debian)
+├── install-plugin.sh          # One-line plugin installer (macOS/Linux)
+├── deploy-server.sh           # Developer deploy script (local → VPS via rsync)
+└── SETUP.md                   # Full step-by-step setup guide
 ```
 
 ---

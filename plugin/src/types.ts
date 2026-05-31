@@ -24,6 +24,10 @@ export interface ServerFileRecord {
   hash: string;
   mtime: number;
   size: number;
+  /** Tombstone flag — set when file was deleted on server */
+  deleted?: boolean;
+  /** Epoch ms when file was deleted (for tombstone TTL) */
+  deletedAt?: number;
 }
 
 /** Full server manifest keyed by vault-relative path */

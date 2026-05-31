@@ -37,8 +37,31 @@ export class ConflictResolver {
     currentLocalHash: string
   ): SyncDecision {
     const localExists = currentLocalHash !== '';
-    const serverExists = serverRecord !== undefined;
     const inManifest = localRecord !== undefined;
+
+    // ── Tombstone handling ──────────────────────────────────────────────
+    // A tombstone means the server explicitly deleted this file.
+    // This is different from serverRecord being undefined (server never had it).
+    const isTombstone = !!serverRecord?.deleted;
+    const serverExists = serverRecord !== undefined && !isTombstone;
+
+    if (isTombstone && localExists) {
+      // Server explicitly deleted this file. If local is unchanged, respect it.
+      if (inManifest && currentLocalHash === localRecord.hash) return 'delete_local';
+      // Local was modified after the delete — still delete (server intent wins
+      // for tombstones, unless the file was never synced before).
+      if (inManifest) return 'delete_local';
+      // File was never in manifest (e.g. after clearAll) but server has a
+      // tombstone — the file WAS deleted, don't re-push it.
+      return 'delete_local';
+    }
+
+    if (isTombstone && !localExists) {
+      // Both sides agree it's gone
+      return 'cleanup_manifest';
+    }
+
+    // ── Standard logic (no tombstone) ──────────────────────────────────
 
     // File never seen before on either side
     if (!inManifest) {
@@ -52,7 +75,7 @@ export class ConflictResolver {
       return 'conflict';
     }
 
-    // File was known, now deleted on server only
+    // File was known, now deleted on server only (no tombstone = old server)
     if (inManifest && !serverExists && localExists) {
       // Server deleted it — if local unchanged respect the delete
       if (currentLocalHash === localRecord.hash) return 'delete_local';
